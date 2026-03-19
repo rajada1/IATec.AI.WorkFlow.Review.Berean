@@ -15,16 +15,9 @@ export interface PRDetails {
   targetBranch: string;
 }
 
-export interface FileContent {
-  path: string;
-  content: string;
-  changeType: string;
-}
-
 export interface PRDiffResult {
   success: boolean;
   diff?: string;
-  files?: FileContent[];
   prDetails?: PRDetails;
   currentIterationId?: number;
   skippedFiles?: number;
@@ -323,8 +316,6 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
     // ── 6. Prioritize code files ───────────────────────────────────────────────
     const MAX_FILES = 40;
     const MAX_FILE_CHARS = 8000;
-    const MAX_FULL_FILE_CHARS = 15000;
-    const MAX_TOTAL_CONTEXT_CHARS = 120000;
     const codeExtensions = ['.js', '.ts', '.py', '.cs', '.java', '.go', '.rs', '.cpp', '.c', '.jsx', '.tsx', '.vue', '.rb', '.php'];
 
     const sortedEntries = [...changeEntries].sort((a, b) => {
@@ -339,45 +330,16 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     const filesToProcess = sortedEntries.slice(0, MAX_FILES);
 
-    // ── 7. Fetch file contents in parallel ────────────────────────────────────
+    // ── 7. Fetch file diffs in parallel ──────────────────────────────────────
     const CONCURRENCY = 8;
     const fileSections: string[] = [];
-    const files: FileContent[] = [];
-    let totalContextChars = 0;
 
     for (let i = 0; i < filesToProcess.length; i += CONCURRENCY) {
       const chunk = filesToProcess.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
-        chunk.map(async (entry) => {
-          const section = await fetchFileSection(entry, ctx, repoId ?? prInfo.repository, sourceBranch, targetBranch, fromCommitId, MAX_FILE_CHARS);
-
-          // Also collect full file content for context
-          const filePath = entry.item?.path ?? entry.path;
-          if (filePath) {
-            const changeType = getChangeTypeName(entry.changeType);
-            try {
-              const srcRes = await fetch(
-                `${ctx.apiBase}/git/repositories/${repoId ?? prInfo.repository}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(sourceBranch)}&versionDescriptor.versionType=branch&includeContent=true&api-version=7.1`,
-                { headers: ctx.headers },
-              );
-              if (srcRes.ok) {
-                const srcData = await srcRes.json() as { content?: string };
-                if (
-                  srcData.content &&
-                  srcData.content.length <= MAX_FULL_FILE_CHARS &&
-                  totalContextChars + srcData.content.length <= MAX_TOTAL_CONTEXT_CHARS
-                ) {
-                  files.push({ path: filePath, content: srcData.content, changeType });
-                  totalContextChars += srcData.content.length;
-                }
-              }
-            } catch {
-              // Ignore — file context is optional
-            }
-          }
-
-          return section;
-        }),
+        chunk.map((entry) =>
+          fetchFileSection(entry, ctx, repoId ?? prInfo.repository, sourceBranch, targetBranch, fromCommitId, MAX_FILE_CHARS),
+        ),
       );
       fileSections.push(...results);
     }
@@ -391,7 +353,6 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
     return {
       success: true,
       diff: diffContent,
-      files,
       prDetails: { title: prData.title, description: prData.description ?? '', sourceBranch, targetBranch },
       currentIterationId,
       skippedFiles,
