@@ -459,6 +459,10 @@ function extractReviewScope(diff: string): ReviewScope {
       continue;
     }
 
+    if (rawLine.startsWith('- ')) {
+      continue;
+    }
+
     if (rawLine.startsWith('  ')) {
       currentLine += 1;
     }
