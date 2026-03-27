@@ -73,6 +73,7 @@ export async function stopClient(): Promise<void> {
 export async function reviewCode(diff: string, options: ReviewOptions = {}): Promise<ReviewResult> {
   const { model = 'gpt-4o', language = 'English', rules } = options;
   const confidenceThreshold = options.confidenceThreshold ?? 75;
+  const reviewScope = extractReviewScope(diff);
 
   try {
     const client = await getClient();
@@ -194,7 +195,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
     }
 
     // Parse the JSON response
-    const result = parseReviewResponse(content, model);
+    const result = parseReviewResponse(content, model, reviewScope);
     if (result.issues && confidenceThreshold) {
       result.issues = result.issues.filter(i => (i.confidence || 100) >= confidenceThreshold);
     }
@@ -217,7 +218,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
         );
         const content = await chatCompletion(token, model, systemFallback, userFallback, 300_000);
         if (content) {
-          const result = parseReviewResponse(content, model);
+          const result = parseReviewResponse(content, model, reviewScope);
           if (result.issues && confidenceThreshold) {
             result.issues = result.issues.filter(i => (i.confidence || 100) >= confidenceThreshold);
           }
@@ -234,7 +235,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
 
 // ─── Response parsing ─────────────────────────────────────────────────────────
 
-function parseReviewResponse(content: string, model: string): ReviewResult {
+function parseReviewResponse(content: string, model: string, reviewScope: ReviewScope): ReviewResult {
   try {
     let jsonContent = content;
 
@@ -282,7 +283,7 @@ function parseReviewResponse(content: string, model: string): ReviewResult {
         success: true,
         summary: parsed.summary,
         recommendation: parsed.recommendation,
-        issues: parsed.issues,
+        issues: filterIssuesToReviewScope(parsed.issues, reviewScope),
         positives: parsed.positives,
         recommendations: parsed.recommendations,
         review: content,
@@ -368,6 +369,7 @@ CRITICAL RULES:
 7. Each issue MUST have a "title" field with a brief one-line description
 8. "suggestion" must contain ONLY executable code ready to replace the problematic code. If you cannot provide exact replacement code, OMIT the "suggestion" field entirely — do NOT put explanatory text, instructions, or pseudo-code in it. The "message" field is where explanations belong.
 9. SCOPE: Review ONLY the lines that were changed in this diff (lines prefixed with + for additions or - for removals). Do NOT report issues for unchanged context lines (those with no prefix or a space prefix) or for code that was not modified in this pull request. Your observations must be exclusively about the user's changes.
+10. You MAY inspect surrounding context and directly related dependencies only to validate whether the changed code introduces a real problem. However, any reported issue must still point to the changed file and to a changed line from this diff. Never anchor findings to untouched files.
 
 SUGGESTION FIELD EXAMPLES:
 
@@ -409,6 +411,90 @@ GOOD (when you can't provide exact code — omit the field):
   const user = `Here is the pull request diff to review (only analyze the changed lines):\n\n${diff}`;
 
   return { system, user };
+}
+
+interface ReviewScope {
+  changedFiles: Set<string>;
+  changedLinesByFile: Map<string, Set<number>>;
+}
+
+function extractReviewScope(diff: string): ReviewScope {
+  const changedFiles = new Set<string>();
+  const changedLinesByFile = new Map<string, Set<number>>();
+
+  let currentFile: string | null = null;
+  let currentLine: number | null = null;
+  let currentChangeType: string | null = null;
+
+  for (const rawLine of diff.split('\n')) {
+    const fileMatch = rawLine.match(/^## ([^:]+): (.+)$/);
+    if (fileMatch) {
+      currentChangeType = fileMatch[1].trim();
+      currentFile = fileMatch[2].trim();
+      changedFiles.add(currentFile);
+      if (!changedLinesByFile.has(currentFile)) {
+        changedLinesByFile.set(currentFile, new Set<number>());
+      }
+      currentLine = currentChangeType === 'Add' ? 1 : null;
+      continue;
+    }
+
+    const hunkMatch = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      currentLine = parseInt(hunkMatch[1], 10);
+      continue;
+    }
+
+    if (!currentFile || currentLine == null) {
+      continue;
+    }
+
+    if (rawLine.startsWith('```')) {
+      continue;
+    }
+
+    if (rawLine.startsWith('+ ')) {
+      changedLinesByFile.get(currentFile)?.add(currentLine);
+      currentLine += 1;
+      continue;
+    }
+
+    if (rawLine.startsWith('  ')) {
+      currentLine += 1;
+    }
+  }
+
+  return { changedFiles, changedLinesByFile };
+}
+
+function filterIssuesToReviewScope(
+  issues: ReviewResult['issues'],
+  reviewScope: ReviewScope,
+): ReviewResult['issues'] {
+  if (!issues || issues.length === 0) {
+    return issues;
+  }
+
+  return issues.filter(issue => {
+    if (!issue.file) {
+      return true;
+    }
+
+    if (!reviewScope.changedFiles.has(issue.file)) {
+      return false;
+    }
+
+    if (issue.line == null) {
+      return true;
+    }
+
+    const changedLines = reviewScope.changedLinesByFile.get(issue.file);
+    if (!changedLines || changedLines.size === 0) {
+      return false;
+    }
+
+    return changedLines.has(issue.line);
+  });
 }
 
 // ─── Rule query generation ────────────────────────────────────────────────────
