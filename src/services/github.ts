@@ -41,6 +41,59 @@ function buildGitHubApiContext(): GitHubApiContext | null {
   };
 }
 
+/**
+ * Build a descriptive error message from a failed HTTP response.
+ *
+ * Includes status code, status text, content-type, and a body preview
+ * so the user has enough context to diagnose the problem.
+ */
+async function buildGitHubErrorMessage(res: Response, label?: string): Promise<string> {
+  const prefix = label ? `${label}: ` : '';
+  const contentType = res.headers.get('content-type') ?? '';
+
+  let bodyPreview: string;
+  try {
+    const raw = await res.text();
+    bodyPreview = raw.substring(0, 500);
+  } catch {
+    bodyPreview = '(could not read response body)';
+  }
+
+  const parts = [
+    `${prefix}HTTP ${res.status} (${res.statusText || 'No Status Text'})`,
+  ];
+  if (contentType) parts.push(`Content-Type: ${contentType}`);
+  if (bodyPreview) parts.push(`Response: ${bodyPreview}`);
+
+  return parts.join('\n  ');
+}
+
+/**
+ * Safely parse a JSON response, guarding against non-JSON bodies.
+ *
+ * If the API returns HTML (e.g. a sign-in page) instead of JSON, calling
+ * `res.json()` throws a confusing `SyntaxError: Unexpected token '<'`.
+ * This helper detects that and throws a descriptive error instead.
+ */
+async function safeGitHubJsonParse<T>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json') && !contentType.includes('application/vnd.github')) {
+    const preview = (await res.text()).substring(0, 500);
+    if (preview.trimStart().startsWith('<')) {
+      throw new Error(
+        'GitHub returned an HTML page instead of JSON. ' +
+        'This usually means the token is invalid or expired. ' +
+        `HTTP ${res.status}\n  Content-Type: ${contentType || '(empty)'}\n  Response: ${preview}`,
+      );
+    }
+    throw new Error(
+      `GitHub returned an unexpected content-type: ${contentType || '(empty)'}. ` +
+      `HTTP ${res.status}\n  Response: ${preview}`,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
 // ─── Parse ────────────────────────────────────────────────────────────────────
 
 /**
@@ -90,18 +143,19 @@ export async function fetchGitHubPRBasicInfo(prInfo: GitHubPRInfo): Promise<PRBa
     );
 
     if (!res.ok) {
-      if (res.status === 401) return { success: false, error: 'GitHub token is invalid or expired' };
-      if (res.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (res.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `GitHub API error: ${res.status}` };
+      const detail = await buildGitHubErrorMessage(res, 'GitHub API error');
+      if (res.status === 401) return { success: false, error: `GitHub token is invalid or expired\n  ${detail}` };
+      if (res.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (res.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as {
+    const data = await safeGitHubJsonParse<{
       title: string;
       body?: string;
       head: { ref: string };
       base: { ref: string };
-    };
+    }>(res);
 
     return {
       success: true,
@@ -146,19 +200,20 @@ export async function fetchGitHubPRDiff(
     );
 
     if (!prRes.ok) {
-      if (prRes.status === 401) return { success: false, error: 'GitHub token is invalid or expired' };
-      if (prRes.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (prRes.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `GitHub API error: ${prRes.status}` };
+      const detail = await buildGitHubErrorMessage(prRes, 'GitHub API error');
+      if (prRes.status === 401) return { success: false, error: `GitHub token is invalid or expired\n  ${detail}` };
+      if (prRes.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (prRes.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const prData = await prRes.json() as {
+    const prData = await safeGitHubJsonParse<{
       title: string;
       body?: string;
       head: { ref: string; sha: string };
       base: { ref: string };
       changed_files: number;
-    };
+    }>(prRes);
 
     const sourceBranch = prData.head.ref;
     const targetBranch = prData.base.ref;
@@ -188,7 +243,7 @@ export async function fetchGitHubPRDiff(
 
       if (!filesRes.ok) break;
 
-      const files = await filesRes.json() as GitHubFile[];
+      const files = await safeGitHubJsonParse<GitHubFile[]>(filesRes);
       if (files.length === 0) break;
 
       allFiles.push(...files);
@@ -317,11 +372,11 @@ export async function postGitHubPRComment(
     );
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildGitHubErrorMessage(res, 'Failed to post comment');
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as { id: number };
+    const data = await safeGitHubJsonParse<{ id: number }>(res);
     return { success: true, threadId: data.id };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -345,11 +400,11 @@ export async function findGitHubBereanComments(prInfo: GitHubPRInfo): Promise<Be
 
     if (!res.ok) return [];
 
-    const comments = await res.json() as Array<{
+    const comments = await safeGitHubJsonParse<Array<{
       id: number;
       body: string;
       created_at: string;
-    }>;
+    }>>(res);
 
     const bereanComments: BereanComment[] = [];
 
@@ -412,7 +467,7 @@ export async function getGitHubPRCommits(prInfo: GitHubPRInfo): Promise<string[]
 
     if (!res.ok) return [];
 
-    const commits = await res.json() as Array<{ sha: string }>;
+    const commits = await safeGitHubJsonParse<Array<{ sha: string }>>(res);
     return commits.map(c => c.sha);
   } catch {
     return [];
@@ -443,8 +498,8 @@ export async function updateGitHubPRComment(
     );
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildGitHubErrorMessage(res, 'Failed to update comment');
+      return { success: false, error: detail };
     }
 
     return { success: true, threadId: commentId };
@@ -482,7 +537,7 @@ export async function postGitHubInlineComments(
 
   let headSha = '';
   if (prRes?.ok) {
-    const prData = await prRes.json() as { head: { sha: string } };
+    const prData = await safeGitHubJsonParse<{ head: { sha: string } }>(prRes);
     headSha = prData.head.sha;
   }
 
@@ -502,10 +557,10 @@ export async function postGitHubInlineComments(
   ).catch(() => null);
 
   if (reviewCommentsRes?.ok) {
-    const existingComments = await reviewCommentsRes.json() as Array<{
+    const existingComments = await safeGitHubJsonParse<Array<{
       path: string;
       line?: number;
-    }>;
+    }>>(reviewCommentsRes);
     for (const c of existingComments) {
       if (c.path && c.line) existingKeys.add(`${c.path}:${c.line}`);
     }
@@ -544,9 +599,9 @@ export async function postGitHubInlineComments(
         results.success++;
         existingKeys.add(key);
       } else {
-        const errorData = await res.json().catch(() => ({})) as { message?: string };
+        const detail = await buildGitHubErrorMessage(res);
         results.failed++;
-        results.errors.push(`${filePath}:${comment.line} - ${errorData.message ?? `HTTP ${res.status}`}`);
+        results.errors.push(`${filePath}:${comment.line} - ${detail}`);
       }
     } catch (error) {
       results.failed++;

@@ -49,6 +49,61 @@ function buildApiContext(prInfo: PRInfo): ApiContext | null {
   };
 }
 
+/**
+ * Build a descriptive error message from a failed HTTP response.
+ *
+ * Includes status code, status text, content-type, and a body preview
+ * so the user has enough context to diagnose the problem.
+ */
+async function buildErrorMessage(res: Response, label?: string): Promise<string> {
+  const prefix = label ? `${label}: ` : '';
+  const contentType = res.headers.get('content-type') ?? '';
+
+  let bodyPreview: string;
+  try {
+    const raw = await res.text();
+    bodyPreview = raw.substring(0, 500);
+  } catch {
+    bodyPreview = '(could not read response body)';
+  }
+
+  const parts = [
+    `${prefix}HTTP ${res.status} (${res.statusText || 'No Status Text'})`,
+  ];
+  if (contentType) parts.push(`Content-Type: ${contentType}`);
+  if (bodyPreview) parts.push(`Response: ${bodyPreview}`);
+
+  return parts.join('\n  ');
+}
+
+/**
+ * Safely parse a JSON response, guarding against non-JSON bodies.
+ *
+ * Azure DevOps may return HTML (e.g. a sign-in page) with a 2xx status
+ * (commonly 203 Non-Authoritative) when the PAT is missing or invalid.
+ * Calling `res.json()` on such a response throws a confusing
+ * `SyntaxError: Unexpected token '<'`.  This helper detects that scenario
+ * early and throws a descriptive error instead.
+ */
+async function safeJsonParse<T>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) {
+    const preview = (await res.text()).substring(0, 500);
+    if (res.status === 203 || preview.trimStart().startsWith('<')) {
+      throw new Error(
+        'Azure DevOps returned an HTML page instead of JSON. ' +
+        'This usually means the PAT is invalid, expired, or lacks the required scope. ' +
+        `HTTP ${res.status}\n  Content-Type: ${contentType || '(empty)'}\n  Response: ${preview}`,
+      );
+    }
+    throw new Error(
+      `Azure DevOps returned an unexpected content-type: ${contentType || '(empty)'}. ` +
+      `HTTP ${res.status}\n  Response: ${preview}`,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
 // ─── Parse ────────────────────────────────────────────────────────────────────
 
 /**
@@ -124,18 +179,19 @@ export async function fetchPRBasicInfo(prInfo: PRInfo): Promise<PRBasicInfoResul
     );
 
     if (!res.ok) {
-      if (res.status === 401) return { success: false, error: 'Azure DevOps token is invalid or expired' };
-      if (res.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (res.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `Azure DevOps API error: ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Azure DevOps API error');
+      if (res.status === 401) return { success: false, error: `Azure DevOps token is invalid or expired\n  ${detail}` };
+      if (res.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (res.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as {
+    const data = await safeJsonParse<{
       title: string;
       description?: string;
       sourceRefName: string;
       targetRefName: string;
-    };
+    }>(res);
 
     return {
       success: true,
@@ -183,19 +239,20 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
     );
 
     if (!prRes.ok) {
-      if (prRes.status === 401) return { success: false, error: 'Azure DevOps token is invalid or expired' };
-      if (prRes.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (prRes.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `Azure DevOps API error: ${prRes.status}` };
+      const detail = await buildErrorMessage(prRes, 'Azure DevOps API error');
+      if (prRes.status === 401) return { success: false, error: `Azure DevOps token is invalid or expired\n  ${detail}` };
+      if (prRes.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (prRes.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const prData = await prRes.json() as {
+    const prData = await safeJsonParse<{
       title: string;
       description?: string;
       sourceRefName: string;
       targetRefName: string;
       repository?: { id: string };
-    };
+    }>(prRes);
 
     const sourceBranch = prData.sourceRefName?.replace('refs/heads/', '');
     const targetBranch = prData.targetRefName?.replace('refs/heads/', '');
@@ -214,7 +271,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
     let fromCommitId: string | undefined;
 
     if (iterRes.ok) {
-      const iterData = await iterRes.json() as { value: IterationItem[] };
+      const iterData = await safeJsonParse<{ value: IterationItem[] }>(iterRes);
       const iterations = iterData.value ?? [];
 
       if (iterations.length > 0) {
@@ -233,7 +290,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
             { headers: ctx.headers },
           );
           if (changesRes.ok) {
-            const changesData = await changesRes.json() as { changeEntries: typeof changeEntries };
+            const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
           }
         } else {
@@ -243,7 +300,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
             { headers: ctx.headers },
           );
           if (changesRes.ok) {
-            const changesData = await changesRes.json() as { changeEntries: typeof changeEntries };
+            const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
           }
         }
@@ -258,7 +315,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
       );
 
       if (commitsRes.ok) {
-        const commitsData = await commitsRes.json() as { value: Array<{ commitId: string }> };
+        const commitsData = await safeJsonParse<{ value: Array<{ commitId: string }> }>(commitsRes);
         const commits = commitsData.value ?? [];
 
         for (const commit of commits) {
@@ -267,7 +324,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
             { headers: ctx.headers },
           );
           if (commitChangesRes.ok) {
-            const commitChangesData = await commitChangesRes.json() as { changes: typeof changeEntries };
+            const commitChangesData = await safeJsonParse<{ changes: typeof changeEntries }>(commitChangesRes);
             for (const change of commitChangesData.changes ?? []) {
               const p = change.item?.path ?? change.path;
               if (p && !changeEntries.find(e => (e.item?.path ?? e.path) === p)) {
@@ -398,7 +455,7 @@ async function fetchFileSection(
       return section;
     }
 
-    const srcData = await srcRes.json() as { content?: string };
+    const srcData = await safeJsonParse<{ content?: string }>(srcRes);
     if (!srcData.content) {
       section += '(Binary or empty file)\n';
       return section;
@@ -424,7 +481,7 @@ async function fetchFileSection(
     );
 
     if (oldRes.ok) {
-      const oldData = await oldRes.json() as { content?: string };
+      const oldData = await safeJsonParse<{ content?: string }>(oldRes);
       const diff = generateUnifiedDiff(oldData.content ?? '', srcData.content, maxChars);
       if (diff) {
         section += '```diff\n' + diff + '\n```\n';
@@ -650,12 +707,12 @@ export async function findBereanComments(prInfo: PRInfo): Promise<BereanComment[
 
     if (!res.ok) return [];
 
-    const data = await res.json() as {
+    const data = await safeJsonParse<{
       value: Array<{
         id: number;
         comments: Array<{ id: number; content: string; publishedDate: string }>;
       }>;
-    };
+    }>(res);
 
     const bereanComments: BereanComment[] = [];
 
@@ -733,7 +790,7 @@ export async function getPRCommits(prInfo: PRInfo): Promise<string[]> {
 
     if (!res.ok) return [];
 
-    const data = await res.json() as { value: Array<{ commitId: string }> };
+    const data = await safeJsonParse<{ value: Array<{ commitId: string }> }>(res);
     return (data.value ?? []).map(c => c.commitId);
   } catch {
     return [];
@@ -776,8 +833,8 @@ export async function updatePRComment(
     );
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to update comment');
+      return { success: false, error: detail };
     }
 
     return { success: true, threadId };
@@ -805,11 +862,11 @@ export async function postPRComment(prInfo: PRInfo, comment: string): Promise<Po
     );
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to post comment');
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as { id: number };
+    const data = await safeJsonParse<{ id: number }>(res);
     return { success: true, threadId: data.id };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -852,7 +909,7 @@ export async function postInlineComments(
   ).catch(() => null);
 
   if (iterRes?.ok) {
-    const iterData = await iterRes.json() as { value: Array<{ id: number }> };
+    const iterData = await safeJsonParse<{ value: Array<{ id: number }> }>(iterRes);
     const iterations = iterData.value ?? [];
     if (iterations.length > 0) iterationId = iterations[iterations.length - 1].id;
   }
@@ -865,12 +922,12 @@ export async function postInlineComments(
   ).catch(() => null);
 
   if (threadsRes?.ok) {
-    const threadsData = await threadsRes.json() as {
+    const threadsData = await safeJsonParse<{
       value: Array<{
         isDeleted?: boolean;
         threadContext?: { filePath?: string; rightFileStart?: { line?: number } };
       }>;
-    };
+    }>(threadsRes);
     for (const thread of threadsData.value ?? []) {
       if (thread.isDeleted) continue;
       const fp = thread.threadContext?.filePath;
@@ -944,11 +1001,11 @@ async function postInlineComment(
     );
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to post inline comment');
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as { id: number };
+    const data = await safeJsonParse<{ id: number }>(res);
     return { success: true, threadId: data.id };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
