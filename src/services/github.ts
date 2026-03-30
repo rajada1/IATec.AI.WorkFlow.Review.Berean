@@ -245,7 +245,7 @@ export async function fetchGitHubPRDiff(
       } else if (file.patch) {
         const patch = file.patch.substring(0, MAX_FILE_CHARS);
         diffContent += '```diff\n' + patch;
-        if (patch.length < (file.patch?.length ?? 0)) diffContent += '\n... (diff truncated)';
+        if (patch.length < file.patch.length) diffContent += '\n... (diff truncated)';
         diffContent += '\n```\n';
       } else {
         diffContent += '(Binary file or diff too large)\n';
@@ -513,7 +513,7 @@ export async function postGitHubInlineComments(
   const results = { success: 0, failed: 0, errors: [] as string[] };
 
   for (const comment of comments) {
-    // Normalise file path — GitHub expects paths without leading slash
+    // Normalize file path — GitHub expects paths without leading slash
     const filePath = comment.filePath.startsWith('/') ? comment.filePath.slice(1) : comment.filePath;
     const key = `${filePath}:${comment.line}`;
 
