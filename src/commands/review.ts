@@ -2,27 +2,22 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import {
-  parsePRUrl,
-  fetchPRBasicInfo,
-  fetchPRDiff,
-  postPRComment,
-  postInlineComments,
-  PRInfo,
-  findBereanComments,
-  getPRCommits,
+  createProviderFromUrl,
+  createProviderFromFlags,
   shouldIgnorePR,
   addReviewedCommitsTag,
   addReviewedIterationTag,
-  updatePRComment,
-} from '../services/azure-devops.js';
+  type PRProvider,
+} from '../services/pr-provider.js';
 import { reviewCode, fetchModels, stopClient, generateRuleQueries, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
 import { isAuthenticated } from '../services/copilot-auth.js';
-import { getAzureDevOpsPATFromPipeline, getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/credentials.js';
+import { getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/credentials.js';
 import { parseRuleSources, resolveRules } from '../services/rules.js';
 
 export const reviewCommand = new Command('review')
   .description('Review a Pull Request')
-  .argument('[url]', 'Azure DevOps PR URL')
+  .argument('[url]', 'Pull Request URL (GitHub or Azure DevOps)')
+  .option('--owner <owner>', 'GitHub repository owner')
   .option('--org <organization>', 'Azure DevOps organization')
   .option('--project <project>', 'Azure DevOps project')
   .option('--repo <repository>', 'Repository name')
@@ -67,39 +62,25 @@ export const reviewCommand = new Command('review')
         process.exit(1);
       }
 
-      // Check Azure DevOps PAT
-      if (!getAzureDevOpsPATFromPipeline()) {
-        console.log(chalk.red('✗ Azure DevOps PAT not configured.'));
-        console.log(chalk.gray('  Set AZURE_DEVOPS_PAT environment variable or run:'));
-        console.log(chalk.gray('  berean config set azure-pat <your-pat>'));
-        process.exit(1);
-      }
-
-      // Parse PR info
-      let prInfo: PRInfo | null = null;
+      // Resolve PR provider (GitHub or Azure DevOps)
+      let providerResult;
 
       if (url) {
-        prInfo = parsePRUrl(url);
-        if (!prInfo) {
-          console.log(chalk.red('✗ Invalid Azure DevOps PR URL'));
-          console.log(chalk.gray('  Expected format: https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}'));
-          process.exit(1);
-        }
-      } else if (options.org && options.project && options.repo && options.pr) {
-        prInfo = {
-          organization: options.org,
-          project: options.project,
-          repository: options.repo,
-          pullRequestId: parseInt(options.pr, 10),
-        };
+        providerResult = createProviderFromUrl(url);
       } else {
-        console.log(chalk.red('✗ Please provide a PR URL or use --org, --project, --repo, --pr flags'));
+        providerResult = createProviderFromFlags(options);
+      }
+
+      if (!providerResult.provider) {
+        console.log(chalk.red(`✗ ${providerResult.error}`));
         process.exit(1);
       }
+
+      const provider = providerResult.provider;
 
       // ── 1. Lightweight PR details fetch (for @berean: ignore check) ──────────
       const infoSpinner = ora('Fetching PR info...').start();
-      const prBasicInfo = await fetchPRBasicInfo(prInfo);
+      const prBasicInfo = await provider.fetchPRBasicInfo();
 
       if (!prBasicInfo.success || !prBasicInfo.prDetails) {
         infoSpinner.fail('Failed to fetch PR info');
@@ -127,8 +108,8 @@ export const reviewCommand = new Command('review')
         const checkSpinner = ora('Checking for existing reviews...').start();
 
         const [bereanComments, prCommits] = await Promise.all([
-          findBereanComments(prInfo),
-          getPRCommits(prInfo),
+          provider.findBereanComments(),
+          provider.getPRCommits(),
         ]);
 
         allCommits = prCommits;
@@ -174,7 +155,7 @@ export const reviewCommand = new Command('review')
         }
       } else {
         // Just get commits for tagging
-        allCommits = await getPRCommits(prInfo);
+        allCommits = await provider.getPRCommits();
         newCommits = allCommits;
       }
 
@@ -189,7 +170,7 @@ export const reviewCommand = new Command('review')
         ? (options.skipFolders as string).split(',').map((f: string) => f.trim()).filter(Boolean)
         : [];
 
-      const diffResult = await fetchPRDiff(prInfo, { fromIterationId, skipFolders });
+      const diffResult = await provider.fetchPRDiff({ fromIterationId, skipFolders });
 
       if (!diffResult.success || !diffResult.diff) {
         diffSpinner.fail('Failed to fetch PR diff');
@@ -275,7 +256,7 @@ export const reviewCommand = new Command('review')
       // ── 6. Post comments ──────────────────────────────────────────────────────
       if (options.postComment) {
         await postGeneralComment(
-          prInfo,
+          provider,
           reviewResult,
           allCommits,
           diffResult.currentIterationId,
@@ -285,7 +266,7 @@ export const reviewCommand = new Command('review')
       }
 
       if (options.inline) {
-        await postInlineIssues(prInfo, reviewResult);
+        await postInlineIssues(provider, reviewResult);
       }
 
       // ── 7. Output ─────────────────────────────────────────────────────────────
@@ -302,7 +283,7 @@ export const reviewCommand = new Command('review')
 // ─── Comment helpers ──────────────────────────────────────────────────────────
 
 async function postGeneralComment(
-  prInfo: PRInfo,
+  provider: PRProvider,
   reviewResult: ReviewResult,
   commitIds: string[] = [],
   currentIterationId: number | undefined,
@@ -327,14 +308,14 @@ async function postGeneralComment(
   if (incremental && existingReview) {
     // Preserve the previous review inside a collapsible <details> block
     const fullComment = buildIncrementalComment(newComment, existingReview.content);
-    result = await updatePRComment(prInfo, existingReview.threadId, existingReview.commentId, fullComment);
+    result = await provider.updatePRComment(existingReview.threadId, existingReview.commentId, fullComment);
     if (result.success) {
       spinner.succeed('Updated existing review comment with new findings!');
     } else {
       spinner.fail(`Failed to update comment: ${result.error}`);
     }
   } else {
-    result = await postPRComment(prInfo, newComment);
+    result = await provider.postPRComment(newComment);
     if (result.success) {
       spinner.succeed('Review posted to PR!');
     } else {
@@ -362,7 +343,7 @@ function buildIncrementalComment(newContent: string, previousContent: string): s
   );
 }
 
-async function postInlineIssues(prInfo: PRInfo, reviewResult: ReviewResult) {
+async function postInlineIssues(provider: PRProvider, reviewResult: ReviewResult) {
   const inlineIssues = (reviewResult.issues ?? []).filter(i => i.file && i.line);
 
   if (inlineIssues.length === 0) {
@@ -378,7 +359,7 @@ async function postInlineIssues(prInfo: PRInfo, reviewResult: ReviewResult) {
     content: formatIssueAsMarkdown(issue),
   }));
 
-  const result = await postInlineComments(prInfo, comments);
+  const result = await provider.postInlineComments(comments);
 
   if (result.failed === 0) {
     spinner.succeed(`Posted ${result.success} inline comments!`);
