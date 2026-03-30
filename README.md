@@ -21,12 +21,12 @@ AI-powered code review CLI for **GitHub** and **Azure DevOps** Pull Requests usi
 ## Installation
 
 ```bash
-# Clone and link (recommended)
-git clone https://github.com/rajada1/berean.git ~/.berean-cli
-cd ~/.berean-cli && npm install && npm link
+# Use the install script (recommended)
+curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
 
-# Or use the install script
-curl -fsSL https://raw.githubusercontent.com/rajada1/berean/main/install.sh | bash
+# Or clone and link manually
+git clone https://github.com/iatecbr/IATec.AI.WorkFlow.Review.Berean.git ~/.berean-cli
+cd ~/.berean-cli && npm install && npm run build && npm link
 ```
 
 **Prerequisite:** GitHub Copilot CLI
@@ -125,10 +125,11 @@ jobs:
         with:
           node-version: '22'
 
-      - run: |
+      - name: Install Copilot CLI and Berean
+        run: |
           npm install -g @github/copilot
-          git clone https://github.com/rajada1/berean.git /tmp/berean
-          cd /tmp/berean && npm install && npm link
+          curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+          echo "$(npm prefix -g)/bin" >> $GITHUB_PATH
 
       - name: Run AI Review
         run: |
@@ -160,8 +161,8 @@ steps:
 
   - script: |
       npm install -g @github/copilot
-      git clone https://github.com/rajada1/berean.git /tmp/berean
-      cd /tmp/berean && npm install && npm link
+      curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+      echo "##vso[task.prependpath]$(npm prefix -g)/bin"
     displayName: 'Install Copilot CLI and Berean'
 
   - script: |
@@ -229,10 +230,11 @@ jobs:
         with:
           node-version: '22'
 
-      - run: |
+      - name: Install Copilot CLI and Berean
+        run: |
           npm install -g @github/copilot
-          git clone https://github.com/rajada1/berean.git /tmp/berean
-          cd /tmp/berean && npm install && npm link
+          curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+          echo "$(npm prefix -g)/bin" >> $GITHUB_PATH
 
       - name: Run AI Review
         run: berean review "${{ inputs.pr_url }}" --post-comment --inline
@@ -258,8 +260,8 @@ steps:
 
   - script: |
       npm install -g @github/copilot
-      git clone https://github.com/rajada1/berean.git /tmp/berean
-      cd /tmp/berean && npm install && npm link
+      curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+      echo "##vso[task.prependpath]$(npm prefix -g)/bin"
     displayName: 'Install Copilot CLI and Berean'
 
   - script: |
