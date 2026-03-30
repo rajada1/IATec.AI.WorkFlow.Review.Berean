@@ -254,8 +254,10 @@ export const reviewCommand = new Command('review')
       reviewSpinner.succeed('Review complete!');
 
       // ── 6. Post comments ──────────────────────────────────────────────────────
+      let postFailed = false;
+
       if (options.postComment) {
-        await postGeneralComment(
+        const success = await postGeneralComment(
           provider,
           reviewResult,
           allCommits,
@@ -263,10 +265,16 @@ export const reviewCommand = new Command('review')
           existingReview,
           options.incremental,
         );
+        if (!success) {
+          postFailed = true;
+        }
       }
 
-      if (options.inline) {
-        await postInlineIssues(provider, reviewResult);
+      if (options.inline && !postFailed) {
+        const success = await postInlineIssues(provider, reviewResult);
+        if (!success) {
+          postFailed = true;
+        }
       }
 
       // ── 7. Output ─────────────────────────────────────────────────────────────
@@ -274,6 +282,10 @@ export const reviewCommand = new Command('review')
         console.log(JSON.stringify(reviewResult, null, 2));
       } else {
         printReviewToTerminal(reviewResult);
+      }
+
+      if (postFailed) {
+        process.exitCode = 1;
       }
     } finally {
       await stopClient();
@@ -289,7 +301,7 @@ async function postGeneralComment(
   currentIterationId: number | undefined,
   existingReview: { threadId: number; commentId: number; content: string } | null = null,
   incremental = false,
-) {
+): Promise<boolean> {
   const spinner = ora('Posting review comment to PR...').start();
 
   // Build the new review markdown
@@ -322,6 +334,8 @@ async function postGeneralComment(
       spinner.fail(`Failed to post comment: ${result.error}`);
     }
   }
+
+  return result.success;
 }
 
 /**
@@ -343,12 +357,12 @@ function buildIncrementalComment(newContent: string, previousContent: string): s
   );
 }
 
-async function postInlineIssues(provider: PRProvider, reviewResult: ReviewResult) {
+async function postInlineIssues(provider: PRProvider, reviewResult: ReviewResult): Promise<boolean> {
   const inlineIssues = (reviewResult.issues ?? []).filter(i => i.file && i.line);
 
   if (inlineIssues.length === 0) {
     console.log(chalk.yellow('  No issues with file/line info for inline comments'));
-    return;
+    return true;
   }
 
   const spinner = ora(`Posting ${inlineIssues.length} inline comments...`).start();
@@ -363,16 +377,19 @@ async function postInlineIssues(provider: PRProvider, reviewResult: ReviewResult
 
   if (result.failed === 0) {
     spinner.succeed(`Posted ${result.success} inline comments!`);
+    return true;
   } else if (result.success > 0) {
     spinner.warn(`Posted ${result.success} comments, ${result.failed} failed`);
     for (const err of result.errors.slice(0, 3)) {
       console.log(chalk.gray(`    ${err}`));
     }
+    return false;
   } else {
     spinner.fail(`Failed to post inline comments`);
     for (const err of result.errors.slice(0, 3)) {
       console.log(chalk.red(`    ${err}`));
     }
+    return false;
   }
 }
 
