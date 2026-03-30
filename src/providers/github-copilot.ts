@@ -320,7 +320,7 @@ You MUST respond with ONLY a valid JSON object (no markdown, no code blocks, no 
       "line": 42,
       "title": "Brief one-line title of the issue",
       "message": "Detailed description of the issue, why it matters, and how to fix it",
-      "suggestion": "Optional: ONLY the corrected code that should replace the problematic code. Must be clean, ready-to-apply code — NO explanatory comments like '// remove this line', '// add this', '// changed from X to Y', etc. The suggestion must contain ONLY the final code the developer should use."
+      "suggestion": "Optional: ONLY the corrected code that should replace the problematic code. Must be clean, ready-to-apply code — NO explanatory comments like '// remove this line', '// add this', '// changed from X to Y', etc. The suggestion must contain ONLY the final code the developer should use. IMPORTANT: Preserve the original indentation of the code exactly as it appears in the diff."
     }
   ],
   "positives": ["List of good practices observed in the code"],
@@ -368,17 +368,20 @@ CRITICAL RULES:
 6. Be specific and actionable — vague suggestions are worse than no suggestions
 7. Each issue MUST have a "title" field with a brief one-line description
 8. "suggestion" must contain ONLY executable code ready to replace the problematic code. If you cannot provide exact replacement code, OMIT the "suggestion" field entirely — do NOT put explanatory text, instructions, or pseudo-code in it. The "message" field is where explanations belong.
-9. SCOPE: Review ONLY the lines that were changed in this diff (lines prefixed with + for additions or - for removals). Do NOT report issues for unchanged context lines (those with no prefix or a space prefix) or for code that was not modified in this pull request. Your observations must be exclusively about the user's changes.
-10. You MAY inspect surrounding context and directly related dependencies only to validate whether the changed code introduces a real problem. However, any reported issue must still point to the changed file and to a changed line from this diff. Never anchor findings to untouched files.
+9. The suggestion will be rendered inside a \`\`\`suggestion code block in the review — it MUST preserve correct indentation exactly as it should appear in the source file. Never use other block types (e.g. xml, csharp, etc.) and never mix comments with code inside the suggestion.
+10. SCOPE: Review ONLY the lines that were changed in this diff (lines prefixed with + for additions or - for removals). Do NOT report issues for unchanged context lines (those with no prefix or a space prefix) or for code that was not modified in this pull request. Your observations must be exclusively about the user's changes.
+11. You MAY inspect surrounding context and directly related dependencies only to validate whether the changed code introduces a real problem. However, any reported issue must still point to the changed file and to a changed line from this diff. Never anchor findings to untouched files.
+12. If a single issue requires multiple code changes in different locations, create SEPARATE issues (each with its own "suggestion" field) — one for each change location. Each suggestion block must correspond to exactly one replacement.
 
 SUGGESTION FIELD EXAMPLES:
 
-GOOD suggestion (exact replacement code):
+GOOD suggestion (exact replacement code with preserved indentation):
 {
   "title": "Missing null check",
   "message": "The variable 'user' can be null when the API returns 404. Add a null check before accessing properties.",
-  "suggestion": "if (user == null) {\\n  throw new Error('User not found');\\n}"
+  "suggestion": "    if (user == null) {\\n      throw new Error('User not found');\\n    }"
 }
+→ Indentation matches the original source file. The suggestion contains ONLY the final corrected code.
 
 BAD suggestion (descriptive text — DO NOT do this):
 {
