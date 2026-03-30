@@ -1,16 +1,16 @@
 # Berean 🔍
 
-> CLI de code review com IA para Pull Requests do Azure DevOps usando GitHub Copilot SDK.
+> CLI de code review com IA para Pull Requests do **GitHub** e **Azure DevOps** usando GitHub Copilot SDK.
 
 *Assim como os Bereanos que examinavam tudo cuidadosamente (Atos 17:11), esta ferramenta examina seu código com diligência.*
 
 ## Funcionalidades
 
 - 🔐 **Múltiplas formas de autenticação** - GitHub Token via env var, Copilot CLI, ou BYOK
-- 🔍 **Extração automática de diff** - Busca alterações diretamente do Azure DevOps
+- 🔍 **Extração automática de diff** - Busca alterações diretamente do GitHub ou Azure DevOps
 - 🤖 **Code review com IA** - Múltiplos modelos (GPT-4o, Claude, Gemini, o3-mini)
 - 📊 **Saída estruturada** - Níveis de severidade, sugestões e recomendações
-- 💬 **Comentários no PR** - Posta reviews diretamente nos PRs do Azure DevOps
+- 💬 **Comentários no PR** - Posta reviews diretamente nos PRs do GitHub ou Azure DevOps
 - 📝 **Comentários inline** - Comenta em linhas específicas do código
 - 🔄 **Proteção anti-loop** - Previne ciclos infinitos de review em CI/CD
 - 🌍 **Multi-idioma** - Respostas em qualquer idioma
@@ -45,14 +45,17 @@ export GITHUB_TOKEN="ghp_xxxxx"
 # ou: export GH_TOKEN="ghp_xxxxx"
 # ou: export COPILOT_GITHUB_TOKEN="ghp_xxxxx"
 
-# PAT do Azure DevOps
+# PAT do Azure DevOps (apenas para PRs do Azure DevOps)
 export AZURE_DEVOPS_PAT="xxxxx"
 
 # (Opcional) Modelo e idioma
 export BEREAN_MODEL="claude-sonnet-4"
 export BEREAN_LANGUAGE="Português do Brasil"
 
-# Revisar um PR
+# Revisar um PR do GitHub
+berean review https://github.com/owner/repo/pull/123
+
+# Revisar um PR do Azure DevOps
 berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 ```
 
@@ -62,10 +65,11 @@ berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 # 1. Autenticar com GitHub Copilot
 berean auth login
 
-# 2. Configurar PAT do Azure DevOps
+# 2. (Opcional) Configurar PAT do Azure DevOps (apenas para PRs do Azure DevOps)
 berean config set azure-pat <seu-pat>
 
 # 3. Revisar um PR
+berean review https://github.com/owner/repo/pull/123
 berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 ```
 
@@ -77,13 +81,13 @@ Todas as configurações podem ser definidas via variáveis de ambiente, ideal p
 
 | Variável | Descrição | Obrigatório |
 |----------|-----------|-------------|
-| `GITHUB_TOKEN` | Token do GitHub para API do Copilot | Sim* |
+| `GITHUB_TOKEN` | Token do GitHub para API do Copilot e PRs do GitHub | Sim* |
 | `GH_TOKEN` | Alternativa ao GITHUB_TOKEN (compat. GitHub CLI) | Sim* |
 | `COPILOT_GITHUB_TOKEN` | Alternativa ao GITHUB_TOKEN (prioridade máxima) | Sim* |
 | `GITHUBTOKEN` | Alternativa (formato Azure DevOps Variable Groups) | Sim* |
-| `AZURE_DEVOPS_PAT` | Personal Access Token do Azure DevOps | Sim |
-| `AZUREDEVOPSPAT` | Alternativa (formato Azure DevOps Variable Groups) | Sim |
-| `SYSTEM_ACCESSTOKEN` | Token automático do Azure Pipelines | Sim |
+| `AZURE_DEVOPS_PAT` | Personal Access Token do Azure DevOps | Para PRs Azure |
+| `AZUREDEVOPSPAT` | Alternativa (formato Azure DevOps Variable Groups) | Para PRs Azure |
+| `SYSTEM_ACCESSTOKEN` | Token automático do Azure Pipelines | Para PRs Azure |
 | `BEREAN_MODEL` | Modelo de IA padrão (ex: `gpt-4o`, `claude-sonnet-4`) | Não |
 | `BEREANMODEL` | Alternativa (formato Azure DevOps Variable Groups) | Não |
 | `BEREAN_LANGUAGE` | Idioma das respostas (ex: `Português do Brasil`) | Não |
@@ -159,10 +163,16 @@ berean review <url> [opções]
 #### Uso Básico
 
 ```bash
-# Revisar por URL
+# Revisar por URL (GitHub)
+berean review https://github.com/owner/repo/pull/123
+
+# Revisar por URL (Azure DevOps)
 berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 
-# Revisar com parâmetros explícitos
+# Revisar com parâmetros explícitos (GitHub)
+berean review --owner myowner --repo myrepo --pr 123
+
+# Revisar com parâmetros explícitos (Azure DevOps)
 berean review --org myorg --project myproj --repo myrepo --pr 123
 ```
 
@@ -170,6 +180,7 @@ berean review --org myorg --project myproj --repo myrepo --pr 123
 
 | Opção | Descrição |
 |-------|-----------|
+| `--owner <owner>` | Dono do repositório GitHub |
 | `--org <organization>` | Organização do Azure DevOps |
 | `--project <project>` | Projeto do Azure DevOps |
 | `--repo <repository>` | Nome do repositório |
@@ -242,7 +253,42 @@ berean update --check  # Apenas verifica se há atualizações
 
 ## Integração CI/CD
 
-### Azure Pipelines
+### GitHub Actions (para PRs do GitHub)
+
+```yaml
+name: AI Code Review
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: |
+          npm install -g @github/copilot
+          git clone https://github.com/rajada1/berean.git /tmp/berean
+          cd /tmp/berean && npm install && npm link
+
+      - name: Executar AI Review
+        run: |
+          berean review "https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}" \
+            --post-comment --inline --skip-if-reviewed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEREAN_MODEL: gpt-4o
+          BEREAN_LANGUAGE: Português do Brasil
+```
+
+### Azure Pipelines (para PRs do Azure DevOps)
 
 ```yaml
 trigger:
@@ -307,11 +353,12 @@ Se usar um PAT manual ao invés do `System.AccessToken`:
 Opções para o token GitHub:
 
 1. **GitHub PAT (Fine-grained)** - Crie em github.com → Settings → Developer settings → Fine-grained tokens
-   - Não precisa de nenhum escopo específico de repositório
-   - Apenas precisa da assinatura do GitHub Copilot ativa na conta
+   - Para PRs do GitHub: precisa de permissão de leitura no repositório e escrita em Pull Requests
+   - Para apenas usar o Copilot (PRs Azure): não precisa de escopo de repositório
 
 2. **GitHub PAT (Classic)** - `ghp_` prefix
-   - Escopo mínimo: nenhum (a assinatura do Copilot é verificada pela conta)
+   - Para PRs do GitHub: escopo `repo` (ou pelo menos `public_repo` para repos públicos)
+   - Para apenas usar o Copilot (PRs Azure): escopo mínimo nenhum
 
 3. **OAuth token** - `gho_` ou `ghu_` prefix (de um GitHub App)
 
@@ -335,9 +382,10 @@ jobs:
         with:
           node-version: '22'
 
-      - run: npm install -g @github/copilot
-      git clone https://github.com/rajada1/berean.git /tmp/berean
-      cd /tmp/berean && npm install && npm link
+      - run: |
+          npm install -g @github/copilot
+          git clone https://github.com/rajada1/berean.git /tmp/berean
+          cd /tmp/berean && npm install && npm link
 
       - name: Executar AI Review
         run: berean review "${{ inputs.pr_url }}" --post-comment --inline
@@ -346,6 +394,36 @@ jobs:
           AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
           BEREAN_MODEL: gpt-4o
           BEREAN_LANGUAGE: Português do Brasil
+```
+
+### Azure Pipelines (para PRs do GitHub)
+
+```yaml
+trigger:
+  - none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '22.x'
+
+  - script: |
+      npm install -g @github/copilot
+      git clone https://github.com/rajada1/berean.git /tmp/berean
+      cd /tmp/berean && npm install && npm link
+    displayName: 'Instalar Copilot CLI e Berean'
+
+  - script: |
+      berean review "https://github.com/owner/repo/pull/$(System.PullRequest.PullRequestNumber)" \
+        --post-comment --inline --skip-if-reviewed
+    displayName: 'Executar AI Code Review'
+    env:
+      GITHUB_TOKEN: $(GithubToken)
+      BEREAN_MODEL: claude-sonnet-4
+      BEREAN_LANGUAGE: Português do Brasil
 ```
 
 ---
