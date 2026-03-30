@@ -39,7 +39,9 @@ chmod +x "$INSTALL_DIR/dist/index.js"
 
 # Link globally (may fail on restricted systems, handled below)
 echo "  Linking globally..."
-npm link 2>&1 || true
+if ! npm link 2>&1; then
+  echo "  ⚠️  npm link failed; falling back to manual symlink"
+fi
 
 # Determine npm global bin directory
 NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
@@ -61,7 +63,7 @@ fi
 add_to_profile() {
   local profile="$1"
   local dir="$2"
-  if [ -f "$profile" ] || [ "$profile" = "$HOME/.bashrc" ]; then
+  if [ -f "$profile" ]; then
     if ! grep -q "$dir" "$profile" 2>/dev/null; then
       {
         echo ""
@@ -73,7 +75,7 @@ add_to_profile() {
 }
 
 # Ensure npm global bin is in PATH for current and future sessions
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$NPM_GLOBAL_BIN"; then
+if [[ ":$PATH:" != *":$NPM_GLOBAL_BIN:"* ]]; then
   export PATH="$NPM_GLOBAL_BIN:$PATH"
   add_to_profile "$HOME/.bashrc" "$NPM_GLOBAL_BIN"
   add_to_profile "$HOME/.profile" "$NPM_GLOBAL_BIN"
