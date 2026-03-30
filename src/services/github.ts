@@ -177,8 +177,10 @@ export async function fetchGitHubPRDiff(
     let allFiles: GitHubFile[] = [];
     let page = 1;
     const perPage = 100;
+    // Fetch up to MAX_FETCH_FILES before filtering/prioritizing (GitHub paginates at 100/page)
+    const MAX_FETCH_FILES = 300;
 
-    while (allFiles.length < 300) {
+    while (allFiles.length < MAX_FETCH_FILES) {
       const filesRes = await fetch(
         `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/files?per_page=${perPage}&page=${page}`,
         { headers: ctx.headers },

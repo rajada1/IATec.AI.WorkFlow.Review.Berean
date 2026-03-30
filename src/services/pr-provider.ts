@@ -165,7 +165,7 @@ function buildGitHubProvider(info: GitHubPRInfo): PRProvider {
     postInlineComments: (c) => postGitHubInlineComments(info, c),
     findBereanComments: () => findGitHubBereanComments(info),
     getPRCommits: () => getGitHubPRCommits(info),
-    updatePRComment: (_t, c, content) => updateGitHubPRComment(info, c, content),
+    updatePRComment: (_threadId, c, content) => updateGitHubPRComment(info, c, content),
   };
 }
 
