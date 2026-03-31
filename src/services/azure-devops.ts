@@ -1,4 +1,4 @@
-import { getAzureDevOpsPATFromPipeline } from './credentials.js';
+import { getAzureDevOpsPATFromPipeline, getAzureDevOpsPATSource } from './credentials.js';
 
 export interface PRInfo {
   organization: string;
@@ -31,7 +31,20 @@ interface ApiContext {
   headers: Record<string, string>;
 }
 
+function log(msg: string): void {
+  if (process.env.BEREAN_VERBOSE) {
+    console.error(msg);
+  }
+}
+
+function logRequest(method: string, url: string): void {
+  log(`[berean] Azure DevOps request: ${method} ${url}`);
+}
+
 function buildApiContext(prInfo: PRInfo): ApiContext | null {
+  const patSource = getAzureDevOpsPATSource();
+  log(`[berean] Azure DevOps PAT source: ${patSource ?? 'not set'}`);
+
   const pat = getAzureDevOpsPATFromPipeline();
   if (!pat) return null;
 
@@ -39,8 +52,11 @@ function buildApiContext(prInfo: PRInfo): ApiContext | null {
     ? `https://${prInfo.hostname}`
     : `https://dev.azure.com/${prInfo.organization}`;
 
+  const apiBase = `${baseUrl}/${prInfo.project}/_apis`;
+  log(`[berean] Azure DevOps API base: ${apiBase}`);
+
   return {
-    apiBase: `${baseUrl}/${prInfo.project}/_apis`,
+    apiBase,
     headers: {
       Authorization: `Basic ${Buffer.from(':' + pat).toString('base64')}`,
       'Content-Type': 'application/json',
@@ -177,10 +193,9 @@ export async function fetchPRBasicInfo(prInfo: PRInfo): Promise<PRBasicInfoResul
   }
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) {
       const detail = await buildErrorMessage(res, 'Azure DevOps API error');
@@ -240,10 +255,9 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
   try {
     // ── 1. PR details ─────────────────────────────────────────────────────────
-    const prRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const prUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`;
+    logRequest('GET', prUrl);
+    const prRes = await fetch(prUrl, { headers: ctx.headers });
 
     if (!prRes.ok) {
       const detail = await buildErrorMessage(prRes, 'Azure DevOps API error');
@@ -267,10 +281,9 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     // ── 2. Iterations ─────────────────────────────────────────────────────────
     type IterationItem = { id: number; sourceRefCommit?: { commitId: string } };
-    const iterRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const iterUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`;
+    logRequest('GET', iterUrl);
+    const iterRes = await fetch(iterUrl, { headers: ctx.headers });
 
     let changeEntries: Array<{ item?: { path: string }; path?: string; changeType?: number }> = [];
     let currentIterationId: number | undefined;
@@ -292,20 +305,18 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
           const fromIter = iterations.find(it => it.id === fromIterationId);
           fromCommitId = fromIter?.sourceRefCommit?.commitId;
 
-          const changesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?$compareTo=${fromIterationId}&api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const changesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?$compareTo=${fromIterationId}&api-version=7.1`;
+          logRequest('GET', changesUrl);
+          const changesRes = await fetch(changesUrl, { headers: ctx.headers });
           if (changesRes.ok) {
             const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
           }
         } else {
           // Full diff from latest iteration
-          const changesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const changesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?api-version=7.1`;
+          logRequest('GET', changesUrl);
+          const changesRes = await fetch(changesUrl, { headers: ctx.headers });
           if (changesRes.ok) {
             const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
@@ -316,20 +327,18 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     // ── 3. Fallback to commits if no iteration data ────────────────────────────
     if (changeEntries.length === 0) {
-      const commitsRes = await fetch(
-        `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`,
-        { headers: ctx.headers },
-      );
+      const commitsUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`;
+      logRequest('GET', commitsUrl);
+      const commitsRes = await fetch(commitsUrl, { headers: ctx.headers });
 
       if (commitsRes.ok) {
         const commitsData = await safeJsonParse<{ value: Array<{ commitId: string }> }>(commitsRes);
         const commits = commitsData.value ?? [];
 
         for (const commit of commits) {
-          const commitChangesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/commits/${commit.commitId}/changes?api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const commitChangesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/commits/${commit.commitId}/changes?api-version=7.1`;
+          logRequest('GET', commitChangesUrl);
+          const commitChangesRes = await fetch(commitChangesUrl, { headers: ctx.headers });
           if (commitChangesRes.ok) {
             const commitChangesData = await safeJsonParse<{ changes: typeof changeEntries }>(commitChangesRes);
             for (const change of commitChangesData.changes ?? []) {
@@ -452,10 +461,9 @@ async function fetchFileSection(
     }
 
     // Current (source branch) content
-    const srcRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(sourceBranch)}&versionDescriptor.versionType=branch&includeContent=true&api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const srcUrl = `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(sourceBranch)}&versionDescriptor.versionType=branch&includeContent=true&api-version=7.1`;
+    logRequest('GET', srcUrl);
+    const srcRes = await fetch(srcUrl, { headers: ctx.headers });
 
     if (!srcRes.ok) {
       section += `(Could not fetch content - ${srcRes.status})\n`;
@@ -482,10 +490,9 @@ async function fetchFileSection(
       ? `versionDescriptor.version=${encodeURIComponent(fromCommitId)}&versionDescriptor.versionType=commit`
       : `versionDescriptor.version=${encodeURIComponent(targetBranch)}&versionDescriptor.versionType=branch`;
 
-    const oldRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&${oldVersionParam}&includeContent=true&api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const oldUrl = `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&${oldVersionParam}&includeContent=true&api-version=7.1`;
+    logRequest('GET', oldUrl);
+    const oldRes = await fetch(oldUrl, { headers: ctx.headers });
 
     if (oldRes.ok) {
       const oldData = await safeJsonParse<{ content?: string }>(oldRes);
@@ -709,10 +716,9 @@ export async function findBereanComments(prInfo: PRInfo): Promise<BereanComment[
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
@@ -800,10 +806,9 @@ export async function getPRCommits(prInfo: PRInfo): Promise<string[]> {
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
@@ -851,10 +856,9 @@ export async function updatePRComment(
   if (!ctx) return { success: false, error: 'Azure DevOps PAT not configured' };
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads/${threadId}/comments/${commentId}?api-version=7.1`,
-      { method: 'PATCH', headers: ctx.headers, body: JSON.stringify({ content: newContent }) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads/${threadId}/comments/${commentId}?api-version=7.1`;
+    logRequest('PATCH', url);
+    const res = await fetch(url, { method: 'PATCH', headers: ctx.headers, body: JSON.stringify({ content: newContent }) });
 
     if (!res.ok) {
       const detail = await buildErrorMessage(res, 'Failed to update comment');
@@ -883,10 +887,9 @@ export async function postPRComment(prInfo: PRInfo, comment: string): Promise<Po
       status: 1,
     };
 
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('POST', url);
+    const res = await fetch(url, { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) });
 
     if (!res.ok) {
       const detail = await buildErrorMessage(res, 'Failed to post comment');
@@ -933,10 +936,9 @@ export async function postInlineComments(
 
   // 1. Fetch iterationId once
   let iterationId = 1;
-  const iterRes = await fetch(
-    `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const iterUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`;
+  logRequest('GET', iterUrl);
+  const iterRes = await fetch(iterUrl, { headers: ctx.headers }).catch(() => null);
 
   if (iterRes?.ok) {
     const iterData = await safeJsonParse<{ value: Array<{ id: number }> }>(iterRes);
@@ -946,10 +948,9 @@ export async function postInlineComments(
 
   // 2. Fetch existing inline threads for deduplication
   const existingKeys = new Set<string>();
-  const threadsRes = await fetch(
-    `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const threadsUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+  logRequest('GET', threadsUrl);
+  const threadsRes = await fetch(threadsUrl, { headers: ctx.headers }).catch(() => null);
 
   if (threadsRes?.ok) {
     const threadsData = await safeJsonParse<{
@@ -1025,10 +1026,9 @@ async function postInlineComment(
       },
     };
 
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('POST', url);
+    const res = await fetch(url, { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) });
 
     if (!res.ok) {
       const detail = await buildErrorMessage(res, 'Failed to post inline comment');

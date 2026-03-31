@@ -1,4 +1,4 @@
-import { getGitHubToken } from './credentials.js';
+import { getGitHubToken, getGitHubTokenSource } from './credentials.js';
 import type {
   PRBasicInfoResult,
   PRDiffResult,
@@ -27,7 +27,20 @@ interface GitHubApiContext {
   headers: Record<string, string>;
 }
 
+function log(msg: string): void {
+  if (process.env.BEREAN_VERBOSE) {
+    console.error(msg);
+  }
+}
+
+function logRequest(method: string, url: string): void {
+  log(`[berean] GitHub request: ${method} ${url}`);
+}
+
 function buildGitHubApiContext(): GitHubApiContext | null {
+  const tokenSource = getGitHubTokenSource();
+  log(`[berean] GitHub token source: ${tokenSource ?? 'not set'}`);
+
   const token = getGitHubToken();
   if (!token) return null;
 
@@ -141,10 +154,9 @@ export async function fetchGitHubPRBasicInfo(prInfo: GitHubPRInfo): Promise<PRBa
   }
 
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`,
-      { headers: ctx.headers },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) {
       const detail = await buildGitHubErrorMessage(res, 'GitHub API error');
@@ -201,10 +213,9 @@ export async function fetchGitHubPRDiff(
 
   try {
     // ── 1. PR metadata ────────────────────────────────────────────────────────
-    const prRes = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`,
-      { headers: ctx.headers },
-    );
+    const prUrl = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`;
+    logRequest('GET', prUrl);
+    const prRes = await fetch(prUrl, { headers: ctx.headers });
 
     if (!prRes.ok) {
       const detail = await buildGitHubErrorMessage(prRes, 'GitHub API error');
@@ -243,10 +254,9 @@ export async function fetchGitHubPRDiff(
     const MAX_FETCH_FILES = 300;
 
     while (allFiles.length < MAX_FETCH_FILES) {
-      const filesRes = await fetch(
-        `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/files?per_page=${perPage}&page=${page}`,
-        { headers: ctx.headers },
-      );
+      const filesUrl = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/files?per_page=${perPage}&page=${page}`;
+      logRequest('GET', filesUrl);
+      const filesRes = await fetch(filesUrl, { headers: ctx.headers });
 
       if (!filesRes.ok) break;
 
@@ -376,14 +386,13 @@ export async function postGitHubPRComment(
   if (!ctx) return { success: false, error: 'GitHub token not configured' };
 
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/${prInfo.pullNumber}/comments`,
-      {
-        method: 'POST',
-        headers: ctx.headers,
-        body: JSON.stringify({ body: comment }),
-      },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/${prInfo.pullNumber}/comments`;
+    logRequest('POST', url);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: ctx.headers,
+      body: JSON.stringify({ body: comment }),
+    });
 
     if (!res.ok) {
       const detail = await buildGitHubErrorMessage(res);
@@ -436,14 +445,13 @@ async function postViaReviewApi(
   ctx: GitHubApiContext,
 ): Promise<PostCommentResult> {
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/reviews`,
-      {
-        method: 'POST',
-        headers: ctx.headers,
-        body: JSON.stringify({ body: comment, event: 'COMMENT' }),
-      },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/reviews`;
+    logRequest('POST', url);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: ctx.headers,
+      body: JSON.stringify({ body: comment, event: 'COMMENT' }),
+    });
 
     if (!res.ok) {
       const detail = await buildGitHubErrorMessage(res);
@@ -469,10 +477,9 @@ export async function findGitHubBereanComments(prInfo: GitHubPRInfo): Promise<Be
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/${prInfo.pullNumber}/comments?per_page=100`,
-      { headers: ctx.headers },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/${prInfo.pullNumber}/comments?per_page=100`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
@@ -538,10 +545,9 @@ export async function getGitHubPRCommits(prInfo: GitHubPRInfo): Promise<string[]
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/commits?per_page=100`,
-      { headers: ctx.headers },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/commits?per_page=100`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
@@ -570,14 +576,13 @@ export async function updateGitHubPRComment(
   if (!ctx) return { success: false, error: 'GitHub token not configured' };
 
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/comments/${commentId}`,
-      {
-        method: 'PATCH',
-        headers: ctx.headers,
-        body: JSON.stringify({ body: newContent }),
-      },
-    );
+    const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/issues/comments/${commentId}`;
+    logRequest('PATCH', url);
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: ctx.headers,
+      body: JSON.stringify({ body: newContent }),
+    });
 
     if (!res.ok) {
       const detail = await buildGitHubErrorMessage(res);
@@ -635,10 +640,9 @@ export async function postGitHubInlineComments(
   }
 
   // 1. Get the head SHA (required for commit_id)
-  const prRes = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const prUrl = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`;
+  logRequest('GET', prUrl);
+  const prRes = await fetch(prUrl, { headers: ctx.headers }).catch(() => null);
 
   let headSha = '';
   if (prRes?.ok) {
@@ -656,10 +660,9 @@ export async function postGitHubInlineComments(
 
   // 2. Fetch existing review comments for deduplication
   const existingKeys = new Set<string>();
-  const reviewCommentsRes = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/comments?per_page=100`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const reviewCommentsUrl = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/comments?per_page=100`;
+  logRequest('GET', reviewCommentsUrl);
+  const reviewCommentsRes = await fetch(reviewCommentsUrl, { headers: ctx.headers }).catch(() => null);
 
   if (reviewCommentsRes?.ok) {
     const existingComments = await safeGitHubJsonParse<Array<{
@@ -685,20 +688,19 @@ export async function postGitHubInlineComments(
     }
 
     try {
-      const res = await fetch(
-        `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/comments`,
-        {
-          method: 'POST',
-          headers: ctx.headers,
-          body: JSON.stringify({
-            body: comment.content,
-            commit_id: headSha,
-            path: filePath,
-            line: comment.line,
-            side: 'RIGHT',
-          }),
-        },
-      );
+      const url = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}/comments`;
+      logRequest('POST', url);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: ctx.headers,
+        body: JSON.stringify({
+          body: comment.content,
+          commit_id: headSha,
+          path: filePath,
+          line: comment.line,
+          side: 'RIGHT',
+        }),
+      });
 
       if (res.ok) {
         results.success++;
