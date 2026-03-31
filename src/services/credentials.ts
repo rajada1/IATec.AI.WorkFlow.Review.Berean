@@ -28,10 +28,32 @@ export function getGitHubToken(): string | null {
 }
 
 /**
+ * Get the source env var for the GitHub token (if any)
+ */
+export function getGitHubTokenSource(): string | null {
+  if (process.env.COPILOT_GITHUB_TOKEN) return 'COPILOT_GITHUB_TOKEN';
+  if (process.env.GH_TOKEN) return 'GH_TOKEN';
+  if (process.env.GITHUB_TOKEN) return 'GITHUB_TOKEN';
+  if (process.env.GITHUBTOKEN) return 'GITHUBTOKEN';
+  return null;
+}
+
+/**
  * Get Azure DevOps PAT from env or config
  */
 export function getAzureDevOpsPAT(): string | null {
   return getAzureDevOpsPATFromPipeline();
+}
+
+/**
+ * Get the source for the current Azure DevOps PAT (if any)
+ */
+export function getAzureDevOpsPATSource(): string | null {
+  if (process.env.AZURE_DEVOPS_PAT) return 'AZURE_DEVOPS_PAT';
+  if (process.env.AZUREDEVOPSPAT) return 'AZUREDEVOPSPAT';
+  if (process.env.SYSTEM_ACCESSTOKEN) return 'SYSTEM_ACCESSTOKEN';
+  if (getConfig().azure_devops_pat) return 'config file';
+  return null;
 }
 
 /**

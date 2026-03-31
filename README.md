@@ -97,10 +97,20 @@ All settings can be configured via environment variables, ideal for CI/CD:
 | `BEREANLANGUAGE` | Alternative (Azure DevOps Variable Groups format) | No |
 | `BEREAN_MAX_RULES_CHARS` | Max total chars for rules input | No |
 | `BEREANMAXRULESCHARS` | Alternative (Azure DevOps Variable Groups format) | No |
+| `BEREAN_VERBOSE` | Verbose logging (token diagnostics and external calls) | No |
 
 \* At least one GitHub token is required (or login via Copilot CLI).
 
 **Configuration priority:** Environment variable → Config file (`~/.berean/config.json`) → Default value
+
+> **Token diagnostics:** With `BEREAN_VERBOSE=1`, Berean logs which env vars supplied the GitHub and Azure DevOps tokens (without printing the tokens).
+
+Example log:
+
+```text
+[berean] GitHub token source: GH_TOKEN
+[berean] Azure DevOps PAT source: SYSTEM_ACCESSTOKEN
+```
 
 > **Default max rules size:** If not set, Berean uses ~65% of the selected model's max context (approx. 4 chars per token) to leave room for diff and instructions. If model limits are unavailable, it falls back to 50,000 chars.
 

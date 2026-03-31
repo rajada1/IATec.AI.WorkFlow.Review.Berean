@@ -95,10 +95,20 @@ Todas as configurações podem ser definidas via variáveis de ambiente, ideal p
 | `BEREANLANGUAGE` | Alternativa (formato Azure DevOps Variable Groups) | Não |
 | `BEREAN_MAX_RULES_CHARS` | Máximo de caracteres para regras | Não |
 | `BEREANMAXRULESCHARS` | Alternativa (formato Azure DevOps Variable Groups) | Não |
+| `BEREAN_VERBOSE` | Log detalhado (diagnóstico de tokens e chamadas externas) | Não |
 
 \* Pelo menos um token GitHub é necessário (ou login via Copilot CLI).
 
 **Prioridade de configuração:** Variável de ambiente → Arquivo de config (`~/.berean/config.json`) → Valor padrão
+
+> **Diagnóstico de tokens:** Com `BEREAN_VERBOSE=1`, o Berean registra a origem do token do GitHub e do Azure DevOps (sem imprimir os tokens).
+
+Exemplo de log:
+
+```text
+[berean] GitHub token source: GH_TOKEN
+[berean] Azure DevOps PAT source: SYSTEM_ACCESSTOKEN
+```
 
 > **Tamanho máximo de regras:** Se não for definido, o Berean usa ~65% do limite do modelo selecionado (aprox. 4 chars por token) para sobrar espaço para diff e instrucoes. Se o limite do modelo não estiver disponível, usa 50.000 chars.
 

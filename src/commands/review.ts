@@ -15,6 +15,12 @@ import { getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/c
 import { parseRuleSources, resolveRules } from '../services/rules.js';
 import { getModelMaxRulesChars } from '../services/model-limits.js';
 
+function log(msg: string): void {
+  if (process.env.BEREAN_VERBOSE) {
+    console.error(msg);
+  }
+}
+
 export const reviewCommand = new Command('review')
   .description('Review a Pull Request')
   .argument('[url]', 'Pull Request URL (GitHub or Azure DevOps)')
@@ -78,6 +84,7 @@ export const reviewCommand = new Command('review')
       }
 
       const provider = providerResult.provider;
+      log(`[berean] Provider: ${provider.platform} (source: ${url ? 'url' : 'flags'})`);
 
       // ── 1. Lightweight PR details fetch (for @berean: ignore check) ──────────
       const infoSpinner = ora('Fetching PR info...').start();
