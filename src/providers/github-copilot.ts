@@ -1,4 +1,4 @@
-import { CopilotClient } from '@github/copilot-sdk';
+import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { getGitHubTokenFromAzure } from '../services/credentials.js';
 import { chatCompletion } from './copilot-http.js';
 
@@ -91,7 +91,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
     log(`[berean] Client started, testing SDK connectivity...`);
 
     let sdkWorks = false;
-    const testSession = await client.createSession({ model, streaming: false });
+    const testSession = await client.createSession({ model, streaming: false, onPermissionRequest: approveAll });
     try {
       const testResponse = await testSession.sendAndWait({ prompt: 'Reply with just: OK' }, 30_000);
       const testContent = testResponse?.data?.content ?? '';
@@ -108,7 +108,12 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
 
     if (sdkWorks) {
       log(`[berean] Using SDK for review...`);
-      const session = await client.createSession({ model, streaming: false, systemMessage: { content: system } });
+      const session = await client.createSession({
+        model,
+        streaming: false,
+        systemMessage: { content: system },
+        onPermissionRequest: approveAll,
+      });
 
       content = await new Promise<string>((resolve, reject) => {
         let result = '';
@@ -549,7 +554,7 @@ ${diff.substring(0, 2_000)}`;
     try {
       const client = await getClient();
       await client.start();
-      const session = await client.createSession({ model, streaming: false });
+      const session = await client.createSession({ model, streaming: false, onPermissionRequest: approveAll });
       const response = await session.sendAndWait({ prompt: userPrompt }, 30_000);
       content = (response?.data?.content as string) ?? '';
     } catch (e) {
