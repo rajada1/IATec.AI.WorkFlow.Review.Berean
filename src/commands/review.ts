@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import * as path from 'path';
 import {
   createProviderFromUrl,
   createProviderFromFlags,
@@ -9,11 +10,12 @@ import {
   addReviewedIterationTag,
   type PRProvider,
 } from '../services/pr-provider.js';
-import { reviewCode, fetchModels, stopClient, generateRuleQueries, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
+import { reviewCode, fetchModels, stopClient, generateRuleQueries, discoverNeededContext, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
 import { isAuthenticated } from '../services/copilot-auth.js';
-import { getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/credentials.js';
+import { getDefaultModel, getDefaultLanguage, getRulesPath, getMemoryFilePath } from '../services/credentials.js';
 import { parseRuleSources, resolveRules } from '../services/rules.js';
 import { getModelMaxRulesChars } from '../services/model-limits.js';
+import { loadMemoryIndex, parseMemoryPointers, resolveTopicFiles } from '../services/memory.js';
 
 function log(msg: string): void {
   if (process.env.BEREAN_VERBOSE) {
@@ -44,6 +46,11 @@ export const reviewCommand = new Command('review')
     'Comma-separated rule sources: file paths, directories, or URLs. ' +
     'URLs with {{query}} are queried dynamically by the LLM. ' +
     'E.g.: ./rules.md,https://host/doc?q={{query}} (or set BEREAN_RULES env)',
+  )
+  .option(
+    '--memory <path>',
+    'Path to MEMORY.md index file for two-phase context discovery (or set BEREAN_MEMORY env). ' +
+    'Auto-discovered if ./MEMORY.md exists.',
   )
   .option(
     '--skip-folders <folders>',
@@ -194,9 +201,49 @@ export const reviewCommand = new Command('review')
         console.log(chalk.gray(`  ⏭️  ${diffResult.skippedFiles} file(s) skipped (--skip-folders: ${skipFolders.join(', ')})`));
       }
 
-      // ── 4. Load project rules (after diff — URL sources need the diff for LLM queries) ──
+      // ── 4. Two-phase context discovery via MEMORY.md ──────────────────────────
       const language = options.language || getDefaultLanguage();
       const model = options.model || getDefaultModel();
+
+      let memoryIndex: string | undefined;
+      let topicFiles: Record<string, string> | undefined;
+
+      const memoryPath = options.memory || getMemoryFilePath();
+      if (memoryPath) {
+        const memoryIndexContent = loadMemoryIndex(memoryPath);
+        if (memoryIndexContent) {
+          const baseDir = path.dirname(path.resolve(memoryPath));
+          const pointers = parseMemoryPointers(memoryIndexContent, baseDir);
+          const memorySpinner = ora(
+            `Memory index loaded (${pointers.length} pointer${pointers.length !== 1 ? 's' : ''}) — discovering context...`,
+          ).start();
+
+          try {
+            const neededPaths = await discoverNeededContext(diffResult.diff, memoryIndexContent, model);
+
+            if (neededPaths.length > 0) {
+              topicFiles = resolveTopicFiles(pointers, neededPaths);
+              const loadedTopics = Object.keys(topicFiles);
+              if (loadedTopics.length > 0) {
+                memorySpinner.succeed(
+                  `Context: loaded ${loadedTopics.length} topic file${loadedTopics.length !== 1 ? 's' : ''} (${loadedTopics.join(', ')})`,
+                );
+                memoryIndex = memoryIndexContent;
+              } else {
+                memorySpinner.succeed('Memory index scanned — no matching topic files found');
+              }
+            } else {
+              memorySpinner.succeed('Memory index scanned — no additional context needed');
+            }
+          } catch (memErr) {
+            memorySpinner.warn(
+              `Memory context discovery failed: ${memErr instanceof Error ? memErr.message : 'Unknown error'} (continuing without extra context)`,
+            );
+          }
+        }
+      }
+
+      // ── 5. Load project rules (after diff — URL sources need the diff for LLM queries) ──
 
       let rules: string | undefined;
       const rulesInput = options.rules || getRulesPath();
@@ -250,6 +297,8 @@ export const reviewCommand = new Command('review')
         model,
         language,
         rules,
+        memoryIndex,
+        topicFiles,
         confidenceThreshold: options.confidenceThreshold ? parseInt(options.confidenceThreshold, 10) : undefined,
       });
 

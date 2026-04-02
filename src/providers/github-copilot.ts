@@ -31,6 +31,10 @@ export interface ReviewOptions {
   maxTokens?: number;
   rules?: string; // Custom rules/guidelines content to include in the prompt
   confidenceThreshold?: number; // default 75
+  /** Raw content of the MEMORY.md index, used for Phase 1 context discovery */
+  memoryIndex?: string;
+  /** Topic file contents resolved from Phase 1, keyed by topic label */
+  topicFiles?: Record<string, string>;
 }
 
 // ─── Verbose logger ───────────────────────────────────────────────────────────
@@ -78,7 +82,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
   try {
     const client = await getClient();
 
-    const { system, user } = buildReviewPrompt(language, diff, rules);
+    const { system, user } = buildReviewPrompt(language, diff, rules, options.topicFiles);
     const promptSize = system.length + user.length;
 
     log(`[berean] Token source: ${getGitHubTokenFromAzure() ? 'env var' : 'SDK default'}`);
@@ -220,6 +224,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
           options.language ?? 'English',
           diff,
           options.rules,
+          options.topicFiles,
         );
         const content = await chatCompletion(token, model, systemFallback, userFallback, 300_000);
         if (content) {
@@ -308,6 +313,7 @@ function buildReviewPrompt(
   language: string,
   diff: string,
   rules?: string,
+  topicFiles?: Record<string, string>,
 ): { system: string; user: string } {
   let system = `You are an expert code reviewer with deep expertise in software engineering best practices, security vulnerabilities, performance optimization, and code quality. Your role is advisory — provide clear, actionable feedback on code quality and potential issues.
 
@@ -416,6 +422,13 @@ GOOD (when you can't provide exact code — omit the field):
     system += `\n\n---\n\nPROJECT-SPECIFIC RULES AND GUIDELINES (use these to evaluate the code, they take priority over general rules):\n\n${rules}`;
   }
 
+  if (topicFiles && Object.keys(topicFiles).length > 0) {
+    const sections = Object.entries(topicFiles)
+      .map(([topic, content]) => `### ${topic}\n\n${content}`)
+      .join('\n\n---\n\n');
+    system += `\n\n---\n\n## Project Context (from memory)\n\nThe following topic files were identified as relevant to this review:\n\n${sections}`;
+  }
+
   const user = `Here is the pull request diff to review (only analyze the changed lines):\n\n${diff}`;
 
   return { system, user };
@@ -507,6 +520,68 @@ function filterIssuesToReviewScope(
 
     return changedLines.has(issue.line);
   });
+}
+
+// ─── Context discovery (Phase 1) ──────────────────────────────────────────────
+
+/**
+ * Phase 1 of the two-phase agentic review.
+ *
+ * Sends the diff + MEMORY.md index to the model and asks it to identify
+ * which topic files are most relevant to review.  Returns a list of relative
+ * paths (as listed in MEMORY.md) to load for Phase 2.
+ *
+ * Uses the HTTP path exclusively (fast 30 s call).  On any failure returns [].
+ */
+export async function discoverNeededContext(
+  diff: string,
+  memoryIndex: string,
+  model: string,
+): Promise<string[]> {
+  const token = getGitHubTokenFromAzure();
+  if (!token) return [];
+
+  const systemPrompt = 'You are a helpful assistant that identifies relevant project documentation files for code review.';
+  const userPrompt = `You are helping prepare a code review. Below is:
+1. A MEMORY.md index listing project documentation files
+2. A code diff to be reviewed
+
+Based on the diff, identify which topic files from the MEMORY.md index would provide the most useful context for a thorough code review.
+
+Respond with ONLY a valid JSON object — no markdown, no explanation.
+Format: { "needed_files": ["relative/path1.md", "relative/path2.md"] }
+Return at most 5 files. If no files are relevant, return: { "needed_files": [] }
+
+MEMORY.md INDEX:
+${memoryIndex.substring(0, 3_000)}
+
+CODE DIFF (excerpt):
+${diff.substring(0, 2_000)}`;
+
+  try {
+    const content = await chatCompletion(token, model, systemPrompt, userPrompt, 30_000);
+    if (!content) return [];
+
+    // Extract JSON object from response
+    const match = content.match(/\{[\s\S]*?\}/);
+    if (!match) return [];
+
+    const parsed = JSON.parse(match[0]) as unknown;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      'needed_files' in parsed &&
+      Array.isArray((parsed as Record<string, unknown>).needed_files)
+    ) {
+      return ((parsed as { needed_files: unknown[] }).needed_files)
+        .filter((f): f is string => typeof f === 'string')
+        .slice(0, 5);
+    }
+  } catch (e) {
+    log(`[berean] discoverNeededContext failed: ${e instanceof Error ? e.message : e}`);
+  }
+
+  return [];
 }
 
 // ─── Rule query generation ────────────────────────────────────────────────────
