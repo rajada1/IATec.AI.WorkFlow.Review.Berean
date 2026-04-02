@@ -13,6 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { getMaxRulesChars } from './credentials.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,9 +46,6 @@ export interface ResolveRulesResult {
 /** Maximum chars returned per URL fetch (per query) */
 const MAX_URL_RESPONSE_CHARS = 3_000;
 
-/** Maximum combined rules injected into the prompt */
-const MAX_TOTAL_RULES_CHARS = 10_000;
-
 /** Timeout (ms) per HTTP fetch */
 const URL_TIMEOUT_MS = 12_000;
 
@@ -60,6 +58,8 @@ const URL_TIMEOUT_MS = 12_000;
  *   - url   → starts with http:// or https://
  *   - directory → resolved path is an existing directory
  *   - file  → anything else (will fail gracefully if path not found)
+ *
+ * @param input Comma-separated rule sources string (from --rules or BEREAN_RULES).
  */
 export function parseRuleSources(input: string): RuleSource[] {
   return input
@@ -89,7 +89,12 @@ export function parseRuleSources(input: string): RuleSource[] {
 
 // ─── File / directory loading ─────────────────────────────────────────────────
 
-function loadFileSource(source: RuleSource): string | null {
+interface LoadResult {
+  content: string | null;
+  error?: string;
+}
+
+function loadFileSource(source: RuleSource): LoadResult {
   try {
     if (source.type === 'directory') {
       const files = fs.readdirSync(source.resolvedValue)
@@ -104,12 +109,23 @@ function loadFileSource(source: RuleSource): string | null {
           parts.push(`### ${file}\n\n${content}`);
         }
       }
-      return parts.length > 0 ? parts.join('\n\n---\n\n') : null;
+      return parts.length > 0
+        ? { content: parts.join('\n\n---\n\n') }
+        : { content: null, error: `Directory is empty: ${source.resolvedValue}` };
     }
 
-    return fs.readFileSync(source.resolvedValue, 'utf-8');
-  } catch {
-    return null;
+    const content = fs.readFileSync(source.resolvedValue, 'utf-8');
+    return { content };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return { content: null, error: `Path does not exist: ${source.resolvedValue}` };
+    }
+    if (code === 'EACCES' || code === 'EPERM') {
+      return { content: null, error: `Permission denied: ${source.resolvedValue}` };
+    }
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return { content: null, error: msg };
   }
 }
 
@@ -118,6 +134,9 @@ function loadFileSource(source: RuleSource): string | null {
 /**
  * Fetch content from a URL.
  * If the URL contains {{query}}, replaces it with the provided query string (URL-encoded).
+ *
+ * @param urlTemplate URL to fetch; may include {{query}} placeholder.
+ * @param query Optional query string to substitute into {{query}}.
  */
 export async function fetchFromUrl(urlTemplate: string, query?: string): Promise<string> {
   const url = query
@@ -154,11 +173,13 @@ function hostname(url: string): string {
  * @param diff            The PR diff — used to generate queries for dynamic URL sources
  * @param generateQueries Callback that asks the LLM for relevant search queries.
  *                        Injected from review.ts to avoid coupling with github-copilot.ts.
+ * @param maxRulesCharsDefault Optional default max rules length when no config/env is set.
  */
 export async function resolveRules(
   sources: RuleSource[],
   diff: string,
   generateQueries: (diff: string) => Promise<string[]>,
+  maxRulesCharsDefault?: number,
 ): Promise<ResolveRulesResult> {
   const parts: string[] = [];
   const report: SourceReport[] = [];
@@ -166,20 +187,20 @@ export async function resolveRules(
   for (const source of sources) {
     // ── File / directory ───────────────────────────────────────────────────────
     if (source.type === 'file' || source.type === 'directory') {
-      const content = loadFileSource(source);
-      if (content) {
+      const result = loadFileSource(source);
+      if (result.content) {
         const label =
           source.type === 'directory'
             ? `Directory: ${source.rawValue}`
             : path.basename(source.resolvedValue);
-        parts.push(`## ${label}\n\n${content}`);
+        parts.push(`## ${label}\n\n${result.content}`);
         report.push({ label: source.rawValue, type: source.type, status: 'ok' });
       } else {
         report.push({
           label: source.rawValue,
           type: source.type,
           status: 'warn',
-          message: `Could not read: ${source.resolvedValue}`,
+          message: result.error || `Could not read: ${source.resolvedValue}`,
         });
       }
       continue;
@@ -271,14 +292,15 @@ export async function resolveRules(
   }
 
   // ── Combine & cap total size ─────────────────────────────────────────────────
+  const maxTotalRulesChars = getMaxRulesChars(maxRulesCharsDefault);
   let combined = parts.join('\n\n---\n\n');
-  if (combined.length > MAX_TOTAL_RULES_CHARS) {
-    combined = combined.substring(0, MAX_TOTAL_RULES_CHARS) + '\n... (rules truncated)';
+  if (combined.length > maxTotalRulesChars) {
+    combined = combined.substring(0, maxTotalRulesChars) + '\n... (rules truncated)';
     report.push({
       label: '(limit)',
       type: 'file',
       status: 'warn',
-      message: `Total rules truncated to ${MAX_TOTAL_RULES_CHARS} chars`,
+      message: `Total rules truncated to ${maxTotalRulesChars} chars (set BEREAN_MAX_RULES_CHARS to adjust)`,
     });
   }
 

@@ -9,6 +9,7 @@ export interface Config {
   default_model?: string;
   language?: string;
   azure_devops_pat?: string;
+  max_rules_chars?: string;
   [key: string]: string | undefined;
 }
 
@@ -19,11 +20,28 @@ function ensureConfigDir(): void {
 }
 
 /**
- * Get GitHub token from environment variables (SDK priority order)
- * Also checks Azure DevOps variable naming conventions
+ * Get GitHub token for GitHub REST API usage.
+ *
+ * For GitHub PR operations, prefer the conventional GITHUB_TOKEN first,
+ * then fall back to the other compatible variable names.
  */
 export function getGitHubToken(): string | null {
-  return getGitHubTokenFromAzure();
+  return process.env.GITHUB_TOKEN
+    || process.env.GH_TOKEN
+    || process.env.COPILOT_GITHUB_TOKEN
+    || process.env.GITHUBTOKEN
+    || null;
+}
+
+/**
+ * Get the source env var for the GitHub REST API token (if any)
+ */
+export function getGitHubTokenSource(): string | null {
+   if (process.env.GITHUB_TOKEN) return 'GITHUB_TOKEN';
+   if (process.env.GH_TOKEN) return 'GH_TOKEN';
+   if (process.env.COPILOT_GITHUB_TOKEN) return 'COPILOT_GITHUB_TOKEN';
+   if (process.env.GITHUBTOKEN) return 'GITHUBTOKEN';
+   return null;
 }
 
 /**
@@ -31,6 +49,17 @@ export function getGitHubToken(): string | null {
  */
 export function getAzureDevOpsPAT(): string | null {
   return getAzureDevOpsPATFromPipeline();
+}
+
+/**
+ * Get the source for the current Azure DevOps PAT (if any)
+ */
+export function getAzureDevOpsPATSource(): string | null {
+  if (process.env.AZURE_DEVOPS_PAT) return 'AZURE_DEVOPS_PAT';
+  if (process.env.AZUREDEVOPSPAT) return 'AZUREDEVOPSPAT';
+  if (process.env.SYSTEM_ACCESSTOKEN) return 'SYSTEM_ACCESSTOKEN';
+  if (getConfig().azure_devops_pat) return 'config file';
+  return null;
 }
 
 /**
@@ -106,7 +135,36 @@ export function getMemoryFilePath(): string | null {
 }
 
 /**
- * Get GitHub token - also checks Azure DevOps common variable names
+ * Get maximum total rules characters from env or config
+ * Priority: BEREAN_MAX_RULES_CHARS → BEREANMAXRULESCHARS → config file → defaultMax → 50000
+ *
+ * @param defaultMax Optional default when no env/config is set.
+ */
+export function getMaxRulesChars(defaultMax?: number): number {
+  const DEFAULT_MAX = 50_000;
+  const fallbackMax = defaultMax && defaultMax > 0 ? Math.floor(defaultMax) : DEFAULT_MAX;
+
+  const envValue = process.env.BEREAN_MAX_RULES_CHARS
+    || process.env.BEREANMAXRULESCHARS;
+
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+
+  const configValue = getConfig().max_rules_chars;
+  if (configValue) {
+    const parsed = parseInt(configValue, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+
+  return fallbackMax;
+}
+
+/**
+ * Get GitHub token for Copilot/SDK flows.
+ *
+ * Keeps the existing priority used by the Copilot integration.
  */
 export function getGitHubTokenFromAzure(): string | null {
   return process.env.COPILOT_GITHUB_TOKEN

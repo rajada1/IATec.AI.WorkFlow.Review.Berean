@@ -1,4 +1,4 @@
-import { getAzureDevOpsPATFromPipeline } from './credentials.js';
+import { getAzureDevOpsPATFromPipeline, getAzureDevOpsPATSource } from './credentials.js';
 
 export interface PRInfo {
   organization: string;
@@ -20,6 +20,7 @@ export interface PRDiffResult {
   diff?: string;
   prDetails?: PRDetails;
   currentIterationId?: number;
+  skippedFiles?: number;
   error?: string;
 }
 
@@ -30,7 +31,20 @@ interface ApiContext {
   headers: Record<string, string>;
 }
 
+function log(msg: string): void {
+  if (process.env.BEREAN_VERBOSE) {
+    console.error(msg);
+  }
+}
+
+function logRequest(method: string, url: string): void {
+  log(`[berean] Azure DevOps request: ${method} ${url}`);
+}
+
 function buildApiContext(prInfo: PRInfo): ApiContext | null {
+  const patSource = getAzureDevOpsPATSource();
+  log(`[berean] Azure DevOps PAT source: ${patSource ?? 'not set'}`);
+
   const pat = getAzureDevOpsPATFromPipeline();
   if (!pat) return null;
 
@@ -38,8 +52,11 @@ function buildApiContext(prInfo: PRInfo): ApiContext | null {
     ? `https://${prInfo.hostname}`
     : `https://dev.azure.com/${prInfo.organization}`;
 
+  const apiBase = `${baseUrl}/${prInfo.project}/_apis`;
+  log(`[berean] Azure DevOps API base: ${apiBase}`);
+
   return {
-    apiBase: `${baseUrl}/${prInfo.project}/_apis`,
+    apiBase,
     headers: {
       Authorization: `Basic ${Buffer.from(':' + pat).toString('base64')}`,
       'Content-Type': 'application/json',
@@ -48,10 +65,67 @@ function buildApiContext(prInfo: PRInfo): ApiContext | null {
   };
 }
 
+/**
+ * Build a descriptive error message from a failed HTTP response.
+ *
+ * Includes status code, status text, content-type, and a body preview
+ * so the user has enough context to diagnose the problem.
+ */
+async function buildErrorMessage(res: Response, label?: string): Promise<string> {
+  const prefix = label ? `${label}: ` : '';
+  const contentType = res.headers.get('content-type') ?? '';
+
+  let bodyPreview: string;
+  try {
+    const raw = await res.text();
+    bodyPreview = raw.substring(0, 500);
+  } catch {
+    bodyPreview = '(could not read response body)';
+  }
+
+  const parts = [
+    `${prefix}HTTP ${res.status} (${res.statusText || 'No Status Text'})`,
+  ];
+  if (contentType) parts.push(`Content-Type: ${contentType}`);
+  if (bodyPreview) parts.push(`Response: ${bodyPreview}`);
+
+  return parts.join('\n  ');
+}
+
+/**
+ * Safely parse a JSON response, guarding against non-JSON bodies.
+ *
+ * Azure DevOps may return HTML (e.g. a sign-in page) with a 2xx status
+ * (commonly 203 Non-Authoritative) when the PAT is missing or invalid.
+ * Calling `res.json()` on such a response throws a confusing
+ * `SyntaxError: Unexpected token '<'`.  This helper detects that scenario
+ * early and throws a descriptive error instead.
+ */
+async function safeJsonParse<T>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) {
+    const preview = (await res.text()).substring(0, 500);
+    if (res.status === 203 || preview.trimStart().startsWith('<')) {
+      throw new Error(
+        'Azure DevOps returned an HTML page instead of JSON. ' +
+        'This usually means the PAT is invalid, expired, or lacks the required scope. ' +
+        `HTTP ${res.status}\n  Content-Type: ${contentType || '(empty)'}\n  Response: ${preview}`,
+      );
+    }
+    throw new Error(
+      `Azure DevOps returned an unexpected content-type: ${contentType || '(empty)'}. ` +
+      `HTTP ${res.status}\n  Response: ${preview}`,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
 // ─── Parse ────────────────────────────────────────────────────────────────────
 
 /**
  * Parse Azure DevOps PR URL into components
+ *
+ * @param url Azure DevOps PR URL to parse.
  */
 export function parsePRUrl(url: string): PRInfo | null {
   // Format: https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}
@@ -106,6 +180,8 @@ export interface PRBasicInfoResult {
 /**
  * Fetch only the PR metadata (title, description, branches) without building a diff.
  * Use this for quick checks (e.g., @berean: ignore) before fetching the full diff.
+ *
+ * @param prInfo Azure DevOps PR identifiers.
  */
 export async function fetchPRBasicInfo(prInfo: PRInfo): Promise<PRBasicInfoResult> {
   const ctx = buildApiContext(prInfo);
@@ -117,24 +193,24 @@ export async function fetchPRBasicInfo(prInfo: PRInfo): Promise<PRBasicInfoResul
   }
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) {
-      if (res.status === 401) return { success: false, error: 'Azure DevOps token is invalid or expired' };
-      if (res.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (res.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `Azure DevOps API error: ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Azure DevOps API error');
+      if (res.status === 401) return { success: false, error: `Azure DevOps token is invalid or expired\n  ${detail}` };
+      if (res.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (res.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as {
+    const data = await safeJsonParse<{
       title: string;
       description?: string;
       sourceRefName: string;
       targetRefName: string;
-    };
+    }>(res);
 
     return {
       success: true,
@@ -164,6 +240,9 @@ export interface FetchDiffOptions {
  *
  * When `options.fromIterationId` is provided, the diff covers only what changed
  * between that iteration and the latest one (true incremental review).
+ *
+ * @param prInfo Azure DevOps PR identifiers.
+ * @param options Diff options (incremental iteration, skip folders).
  */
 export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}): Promise<PRDiffResult> {
   const ctx = buildApiContext(prInfo);
@@ -176,25 +255,25 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
   try {
     // ── 1. PR details ─────────────────────────────────────────────────────────
-    const prRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const prUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}?api-version=7.1`;
+    logRequest('GET', prUrl);
+    const prRes = await fetch(prUrl, { headers: ctx.headers });
 
     if (!prRes.ok) {
-      if (prRes.status === 401) return { success: false, error: 'Azure DevOps token is invalid or expired' };
-      if (prRes.status === 403) return { success: false, error: 'Access denied. Check your token permissions.' };
-      if (prRes.status === 404) return { success: false, error: 'Pull request not found. Check the URL.' };
-      return { success: false, error: `Azure DevOps API error: ${prRes.status}` };
+      const detail = await buildErrorMessage(prRes, 'Azure DevOps API error');
+      if (prRes.status === 401) return { success: false, error: `Azure DevOps token is invalid or expired\n  ${detail}` };
+      if (prRes.status === 403) return { success: false, error: `Access denied. Check your token permissions.\n  ${detail}` };
+      if (prRes.status === 404) return { success: false, error: `Pull request not found. Check the URL.\n  ${detail}` };
+      return { success: false, error: detail };
     }
 
-    const prData = await prRes.json() as {
+    const prData = await safeJsonParse<{
       title: string;
       description?: string;
       sourceRefName: string;
       targetRefName: string;
       repository?: { id: string };
-    };
+    }>(prRes);
 
     const sourceBranch = prData.sourceRefName?.replace('refs/heads/', '');
     const targetBranch = prData.targetRefName?.replace('refs/heads/', '');
@@ -202,10 +281,9 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     // ── 2. Iterations ─────────────────────────────────────────────────────────
     type IterationItem = { id: number; sourceRefCommit?: { commitId: string } };
-    const iterRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const iterUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`;
+    logRequest('GET', iterUrl);
+    const iterRes = await fetch(iterUrl, { headers: ctx.headers });
 
     let changeEntries: Array<{ item?: { path: string }; path?: string; changeType?: number }> = [];
     let currentIterationId: number | undefined;
@@ -213,7 +291,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
     let fromCommitId: string | undefined;
 
     if (iterRes.ok) {
-      const iterData = await iterRes.json() as { value: IterationItem[] };
+      const iterData = await safeJsonParse<{ value: IterationItem[] }>(iterRes);
       const iterations = iterData.value ?? [];
 
       if (iterations.length > 0) {
@@ -227,22 +305,20 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
           const fromIter = iterations.find(it => it.id === fromIterationId);
           fromCommitId = fromIter?.sourceRefCommit?.commitId;
 
-          const changesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?$compareTo=${fromIterationId}&api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const changesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?$compareTo=${fromIterationId}&api-version=7.1`;
+          logRequest('GET', changesUrl);
+          const changesRes = await fetch(changesUrl, { headers: ctx.headers });
           if (changesRes.ok) {
-            const changesData = await changesRes.json() as { changeEntries: typeof changeEntries };
+            const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
           }
         } else {
           // Full diff from latest iteration
-          const changesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const changesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations/${currentIterationId}/changes?api-version=7.1`;
+          logRequest('GET', changesUrl);
+          const changesRes = await fetch(changesUrl, { headers: ctx.headers });
           if (changesRes.ok) {
-            const changesData = await changesRes.json() as { changeEntries: typeof changeEntries };
+            const changesData = await safeJsonParse<{ changeEntries: typeof changeEntries }>(changesRes);
             changeEntries = changesData.changeEntries ?? [];
           }
         }
@@ -251,22 +327,20 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     // ── 3. Fallback to commits if no iteration data ────────────────────────────
     if (changeEntries.length === 0) {
-      const commitsRes = await fetch(
-        `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`,
-        { headers: ctx.headers },
-      );
+      const commitsUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`;
+      logRequest('GET', commitsUrl);
+      const commitsRes = await fetch(commitsUrl, { headers: ctx.headers });
 
       if (commitsRes.ok) {
-        const commitsData = await commitsRes.json() as { value: Array<{ commitId: string }> };
+        const commitsData = await safeJsonParse<{ value: Array<{ commitId: string }> }>(commitsRes);
         const commits = commitsData.value ?? [];
 
         for (const commit of commits) {
-          const commitChangesRes = await fetch(
-            `${ctx.apiBase}/git/repositories/${prInfo.repository}/commits/${commit.commitId}/changes?api-version=7.1`,
-            { headers: ctx.headers },
-          );
+          const commitChangesUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/commits/${commit.commitId}/changes?api-version=7.1`;
+          logRequest('GET', commitChangesUrl);
+          const commitChangesRes = await fetch(commitChangesUrl, { headers: ctx.headers });
           if (commitChangesRes.ok) {
-            const commitChangesData = await commitChangesRes.json() as { changes: typeof changeEntries };
+            const commitChangesData = await safeJsonParse<{ changes: typeof changeEntries }>(commitChangesRes);
             for (const change of commitChangesData.changes ?? []) {
               const p = change.item?.path ?? change.path;
               if (p && !changeEntries.find(e => (e.item?.path ?? e.path) === p)) {
@@ -302,21 +376,19 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     // ── 5. Apply skip-folders filter ──────────────────────────────────────────
     const { skipFolders = [] } = options;
+    let skippedFiles = 0;
     if (skipFolders.length > 0) {
       const before = changeEntries.length;
       changeEntries = changeEntries.filter(entry => {
         const p = entry.item?.path ?? entry.path ?? '';
         return !isPathInSkippedFolder(p, skipFolders);
       });
-      const skipped = before - changeEntries.length;
-      if (skipped > 0) {
-        diffContent += `\n> ⏭️ ${skipped} file(s) skipped (--skip-folders: ${skipFolders.join(', ')})\n`;
-      }
+      skippedFiles = before - changeEntries.length;
     }
 
     // ── 6. Prioritize code files ───────────────────────────────────────────────
     const MAX_FILES = 40;
-    const MAX_FILE_CHARS = 5000;
+    const MAX_FILE_CHARS = 8000;
     const codeExtensions = ['.js', '.ts', '.py', '.cs', '.java', '.go', '.rs', '.cpp', '.c', '.jsx', '.tsx', '.vue', '.rb', '.php'];
 
     const sortedEntries = [...changeEntries].sort((a, b) => {
@@ -331,14 +403,14 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
 
     const filesToProcess = sortedEntries.slice(0, MAX_FILES);
 
-    // ── 6. Fetch file contents in parallel ────────────────────────────────────
+    // ── 7. Fetch file diffs in parallel ──────────────────────────────────────
     const CONCURRENCY = 8;
     const fileSections: string[] = [];
 
     for (let i = 0; i < filesToProcess.length; i += CONCURRENCY) {
       const chunk = filesToProcess.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
-        chunk.map(entry =>
+        chunk.map((entry) =>
           fetchFileSection(entry, ctx, repoId ?? prInfo.repository, sourceBranch, targetBranch, fromCommitId, MAX_FILE_CHARS),
         ),
       );
@@ -356,6 +428,7 @@ export async function fetchPRDiff(prInfo: PRInfo, options: FetchDiffOptions = {}
       diff: diffContent,
       prDetails: { title: prData.title, description: prData.description ?? '', sourceBranch, targetBranch },
       currentIterationId,
+      skippedFiles,
     };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -388,17 +461,16 @@ async function fetchFileSection(
     }
 
     // Current (source branch) content
-    const srcRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(sourceBranch)}&versionDescriptor.versionType=branch&includeContent=true&api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const srcUrl = `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(sourceBranch)}&versionDescriptor.versionType=branch&includeContent=true&api-version=7.1`;
+    logRequest('GET', srcUrl);
+    const srcRes = await fetch(srcUrl, { headers: ctx.headers });
 
     if (!srcRes.ok) {
       section += `(Could not fetch content - ${srcRes.status})\n`;
       return section;
     }
 
-    const srcData = await srcRes.json() as { content?: string };
+    const srcData = await safeJsonParse<{ content?: string }>(srcRes);
     if (!srcData.content) {
       section += '(Binary or empty file)\n';
       return section;
@@ -418,13 +490,12 @@ async function fetchFileSection(
       ? `versionDescriptor.version=${encodeURIComponent(fromCommitId)}&versionDescriptor.versionType=commit`
       : `versionDescriptor.version=${encodeURIComponent(targetBranch)}&versionDescriptor.versionType=branch`;
 
-    const oldRes = await fetch(
-      `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&${oldVersionParam}&includeContent=true&api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const oldUrl = `${ctx.apiBase}/git/repositories/${repoId}/items?path=${encodeURIComponent(filePath)}&${oldVersionParam}&includeContent=true&api-version=7.1`;
+    logRequest('GET', oldUrl);
+    const oldRes = await fetch(oldUrl, { headers: ctx.headers });
 
     if (oldRes.ok) {
-      const oldData = await oldRes.json() as { content?: string };
+      const oldData = await safeJsonParse<{ content?: string }>(oldRes);
       const diff = generateUnifiedDiff(oldData.content ?? '', srcData.content, maxChars);
       if (diff) {
         section += '```diff\n' + diff + '\n```\n';
@@ -637,25 +708,26 @@ const BEREAN_ITERATION_END = ':berean-iteration -->';
 
 /**
  * Find existing Berean review comments on a PR
+ *
+ * @param prInfo Azure DevOps PR identifiers.
  */
 export async function findBereanComments(prInfo: PRInfo): Promise<BereanComment[]> {
   const ctx = buildApiContext(prInfo);
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
-    const data = await res.json() as {
+    const data = await safeJsonParse<{
       value: Array<{
         id: number;
         comments: Array<{ id: number; content: string; publishedDate: string }>;
       }>;
-    };
+    }>(res);
 
     const bereanComments: BereanComment[] = [];
 
@@ -705,6 +777,9 @@ function extractReviewedIteration(content: string): number | undefined {
 
 /**
  * Embed the list of reviewed commit IDs into a comment (as a hidden HTML tag)
+ *
+ * @param comment Existing comment body.
+ * @param commitIds Commit SHAs that were reviewed.
  */
 export function addReviewedCommitsTag(comment: string, commitIds: string[]): string {
   const tag = `${BEREAN_COMMITS_START}${commitIds.join(',')}${BEREAN_COMMITS_END}`;
@@ -713,6 +788,9 @@ export function addReviewedCommitsTag(comment: string, commitIds: string[]): str
 
 /**
  * Embed the reviewed iteration ID into a comment (as a hidden HTML tag)
+ *
+ * @param comment Existing comment body.
+ * @param iterationId Iteration ID that was reviewed.
  */
 export function addReviewedIterationTag(comment: string, iterationId: number): string {
   return `${comment}\n${BEREAN_ITERATION_START}${iterationId}${BEREAN_ITERATION_END}`;
@@ -720,20 +798,21 @@ export function addReviewedIterationTag(comment: string, iterationId: number): s
 
 /**
  * Get all commit IDs for a PR
+ *
+ * @param prInfo Azure DevOps PR identifiers.
  */
 export async function getPRCommits(prInfo: PRInfo): Promise<string[]> {
   const ctx = buildApiContext(prInfo);
   if (!ctx) return [];
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`,
-      { headers: ctx.headers },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/commits?api-version=7.1`;
+    logRequest('GET', url);
+    const res = await fetch(url, { headers: ctx.headers });
 
     if (!res.ok) return [];
 
-    const data = await res.json() as { value: Array<{ commitId: string }> };
+    const data = await safeJsonParse<{ value: Array<{ commitId: string }> }>(res);
     return (data.value ?? []).map(c => c.commitId);
   } catch {
     return [];
@@ -743,6 +822,8 @@ export async function getPRCommits(prInfo: PRInfo): Promise<string[]> {
 /**
  * Check if PR description contains an ignore keyword.
  * Normalises whitespace so "@ berean : ignore" also matches.
+ *
+ * @param description PR description text.
  */
 export function shouldIgnorePR(description: string | undefined): boolean {
   if (!description) return false;
@@ -759,6 +840,11 @@ export function shouldIgnorePR(description: string | undefined): boolean {
 
 /**
  * Update an existing Berean comment (for incremental reviews)
+ *
+ * @param prInfo Azure DevOps PR identifiers.
+ * @param threadId Thread ID of the existing comment.
+ * @param commentId Comment ID to update.
+ * @param newContent New comment body.
  */
 export async function updatePRComment(
   prInfo: PRInfo,
@@ -770,14 +856,13 @@ export async function updatePRComment(
   if (!ctx) return { success: false, error: 'Azure DevOps PAT not configured' };
 
   try {
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads/${threadId}/comments/${commentId}?api-version=7.1`,
-      { method: 'PATCH', headers: ctx.headers, body: JSON.stringify({ content: newContent }) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads/${threadId}/comments/${commentId}?api-version=7.1`;
+    logRequest('PATCH', url);
+    const res = await fetch(url, { method: 'PATCH', headers: ctx.headers, body: JSON.stringify({ content: newContent }) });
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to update comment');
+      return { success: false, error: detail };
     }
 
     return { success: true, threadId };
@@ -788,6 +873,9 @@ export async function updatePRComment(
 
 /**
  * Post a general comment to a PR
+ *
+ * @param prInfo Azure DevOps PR identifiers.
+ * @param comment Comment body to post.
  */
 export async function postPRComment(prInfo: PRInfo, comment: string): Promise<PostCommentResult> {
   const ctx = buildApiContext(prInfo);
@@ -799,17 +887,16 @@ export async function postPRComment(prInfo: PRInfo, comment: string): Promise<Po
       status: 1,
     };
 
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('POST', url);
+    const res = await fetch(url, { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) });
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to post comment');
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as { id: number };
+    const data = await safeJsonParse<{ id: number }>(res);
     return { success: true, threadId: data.id };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -830,6 +917,9 @@ export interface InlineComment {
  * Improvements over the previous version:
  * - Fetches the latest iterationId once (instead of per-comment)
  * - Skips file:line locations that already have an open inline thread
+ *
+ * @param prInfo Azure DevOps PR identifiers.
+ * @param comments Inline comments to post.
  */
 export async function postInlineComments(
   prInfo: PRInfo,
@@ -846,31 +936,29 @@ export async function postInlineComments(
 
   // 1. Fetch iterationId once
   let iterationId = 1;
-  const iterRes = await fetch(
-    `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const iterUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/iterations?api-version=7.1`;
+  logRequest('GET', iterUrl);
+  const iterRes = await fetch(iterUrl, { headers: ctx.headers }).catch(() => null);
 
   if (iterRes?.ok) {
-    const iterData = await iterRes.json() as { value: Array<{ id: number }> };
+    const iterData = await safeJsonParse<{ value: Array<{ id: number }> }>(iterRes);
     const iterations = iterData.value ?? [];
     if (iterations.length > 0) iterationId = iterations[iterations.length - 1].id;
   }
 
   // 2. Fetch existing inline threads for deduplication
   const existingKeys = new Set<string>();
-  const threadsRes = await fetch(
-    `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-    { headers: ctx.headers },
-  ).catch(() => null);
+  const threadsUrl = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+  logRequest('GET', threadsUrl);
+  const threadsRes = await fetch(threadsUrl, { headers: ctx.headers }).catch(() => null);
 
   if (threadsRes?.ok) {
-    const threadsData = await threadsRes.json() as {
+    const threadsData = await safeJsonParse<{
       value: Array<{
         isDeleted?: boolean;
         threadContext?: { filePath?: string; rightFileStart?: { line?: number } };
       }>;
-    };
+    }>(threadsRes);
     for (const thread of threadsData.value ?? []) {
       if (thread.isDeleted) continue;
       const fp = thread.threadContext?.filePath;
@@ -938,17 +1026,16 @@ async function postInlineComment(
       },
     };
 
-    const res = await fetch(
-      `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`,
-      { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) },
-    );
+    const url = `${ctx.apiBase}/git/repositories/${prInfo.repository}/pullRequests/${prInfo.pullRequestId}/threads?api-version=7.1`;
+    logRequest('POST', url);
+    const res = await fetch(url, { method: 'POST', headers: ctx.headers, body: JSON.stringify(threadPayload) });
 
     if (!res.ok) {
-      const errorData = await res.json().catch(() => ({})) as { message?: string };
-      return { success: false, error: errorData.message ?? `HTTP ${res.status}` };
+      const detail = await buildErrorMessage(res, 'Failed to post inline comment');
+      return { success: false, error: detail };
     }
 
-    const data = await res.json() as { id: number };
+    const data = await safeJsonParse<{ id: number }>(res);
     return { success: true, threadId: data.id };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };

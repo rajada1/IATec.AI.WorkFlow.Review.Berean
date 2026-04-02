@@ -2,17 +2,17 @@
 
 > **🌍 Language / Idioma:** **English** | [Português](README.pt-BR.md)
 
-AI-powered code review CLI for Azure DevOps Pull Requests using GitHub Copilot SDK.
+AI-powered code review CLI for **GitHub** and **Azure DevOps** Pull Requests using GitHub Copilot SDK.
 
 *Just as the Bereans examined everything carefully (Acts 17:11), this tool examines your code with diligence.*
 
 ## Features
 
 - 🔐 **Multiple auth methods** - GitHub Token via env var, Copilot CLI, or BYOK
-- 🔍 **Automatic diff extraction** - Fetches changes directly from Azure DevOps
+- 🔍 **Automatic diff extraction** - Fetches changes directly from GitHub or Azure DevOps
 - 🤖 **AI code review** - Multiple models (GPT-4o, Claude, Gemini, o3-mini)
 - 📊 **Structured output** - Severity levels, suggestions and recommendations
-- 💬 **PR comments** - Posts reviews directly on Azure DevOps PRs
+- 💬 **PR comments** - Posts reviews directly on GitHub or Azure DevOps PRs
 - 📝 **Inline comments** - Comments on specific code lines
 - 🔄 **Anti-loop protection** - Prevents infinite review cycles in CI/CD
 - 🌍 **Multi-language** - Responses in any language
@@ -21,12 +21,12 @@ AI-powered code review CLI for Azure DevOps Pull Requests using GitHub Copilot S
 ## Installation
 
 ```bash
-# Clone and link (recommended)
-git clone https://github.com/rajada1/berean.git ~/.berean-cli
-cd ~/.berean-cli && npm install && npm link
+# Use the install script (recommended)
+curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
 
-# Or use the install script
-curl -fsSL https://raw.githubusercontent.com/rajada1/berean/main/install.sh | bash
+# Or clone and link manually
+git clone https://github.com/iatecbr/IATec.AI.WorkFlow.Review.Berean.git ~/.berean-cli
+cd ~/.berean-cli && npm install && npm run build && npm link
 ```
 
 **Prerequisite:** GitHub Copilot CLI
@@ -39,22 +39,28 @@ npm install -g @github/copilot
 
 ## Quick Start
 
-### Option 1: Environment Variables (recommended for CI/CD)
+### Option 1: Environment Variables (only when your token type is accepted by the Copilot endpoint)
 
 ```bash
 # GitHub Token (any of these)
+# Note: a regular PAT may fail with 403 on /copilot_internal/v2/token.
+# For local development, prefer `berean auth login`.
 export GITHUB_TOKEN="ghp_xxxxx"
 # or: export GH_TOKEN="ghp_xxxxx"
 # or: export COPILOT_GITHUB_TOKEN="ghp_xxxxx"
 
-# Azure DevOps PAT
+# Azure DevOps PAT (only needed for Azure DevOps PRs)
 export AZURE_DEVOPS_PAT="xxxxx"
 
-# (Optional) Model and language
+# (Optional) Model, language, and rules size
 export BEREAN_MODEL="claude-sonnet-4"
 export BEREAN_LANGUAGE="English"
+export BEREAN_MAX_RULES_CHARS="50000"
 
-# Review a PR
+# Review a GitHub PR
+berean review https://github.com/owner/repo/pull/123
+
+# Review an Azure DevOps PR
 berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 ```
 
@@ -64,10 +70,11 @@ berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 # 1. Authenticate with GitHub Copilot
 berean auth login
 
-# 2. Configure Azure DevOps PAT
+# 2. (Optional) Configure Azure DevOps PAT (only for Azure DevOps PRs)
 berean config set azure-pat <your-pat>
 
 # 3. Review a PR
+berean review https://github.com/owner/repo/pull/123
 berean review https://dev.azure.com/org/project/_git/repo/pullrequest/123
 ```
 
@@ -79,21 +86,35 @@ All settings can be configured via environment variables, ideal for CI/CD:
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `GITHUB_TOKEN` | GitHub token for Copilot API | Yes* |
+| `GITHUB_TOKEN` | GitHub token for GitHub PRs and HTTP Copilot auth attempts | Yes* |
 | `GH_TOKEN` | Alternative to GITHUB_TOKEN (GitHub CLI compat.) | Yes* |
 | `COPILOT_GITHUB_TOKEN` | Alternative to GITHUB_TOKEN (highest priority) | Yes* |
 | `GITHUBTOKEN` | Alternative (Azure DevOps Variable Groups format) | Yes* |
-| `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token | Yes |
-| `AZUREDEVOPSPAT` | Alternative (Azure DevOps Variable Groups format) | Yes |
-| `SYSTEM_ACCESSTOKEN` | Azure Pipelines automatic token | Yes |
+| `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token | For Azure PRs |
+| `AZUREDEVOPSPAT` | Alternative (Azure DevOps Variable Groups format) | For Azure PRs |
+| `SYSTEM_ACCESSTOKEN` | Azure Pipelines automatic token | For Azure PRs |
 | `BEREAN_MODEL` | Default AI model (e.g., `gpt-4o`, `claude-sonnet-4`) | No |
 | `BEREANMODEL` | Alternative (Azure DevOps Variable Groups format) | No |
 | `BEREAN_LANGUAGE` | Response language (e.g., `English`, `Português do Brasil`) | No |
 | `BEREANLANGUAGE` | Alternative (Azure DevOps Variable Groups format) | No |
+| `BEREAN_MAX_RULES_CHARS` | Max total chars for rules input | No |
+| `BEREANMAXRULESCHARS` | Alternative (Azure DevOps Variable Groups format) | No |
+| `BEREAN_VERBOSE` | Verbose logging (token diagnostics and external calls) | No |
 
-\* At least one GitHub token is required (or login via Copilot CLI).
+\* For Copilot, an environment token only works if that token type is accepted by the token exchange endpoint. Personal access tokens may fail with `403 Resource not accessible by personal access token`. For local development, use `berean auth login`.
 
 **Configuration priority:** Environment variable → Config file (`~/.berean/config.json`) → Default value
+
+> **Token diagnostics:** With `BEREAN_VERBOSE=1`, Berean logs which env vars supplied the GitHub and Azure DevOps tokens (without printing the tokens).
+
+Example log:
+
+```text
+[berean] GitHub token source: GH_TOKEN
+[berean] Azure DevOps PAT source: SYSTEM_ACCESSTOKEN
+```
+
+> **Default max rules size:** If not set, Berean uses ~65% of the selected model's max context (approx. 4 chars per token) to leave room for diff and instructions. If model limits are unavailable, it falls back to 50,000 chars.
 
 > **💡 Azure DevOps Variable Groups:** Variables defined in Azure Pipelines Variable Groups have dots and hyphens stripped (e.g., `Berean.Model` becomes `BEREAN_MODEL`, `BereanModel` becomes `BEREANMODEL`). Berean accepts both formats automatically.
 
@@ -101,7 +122,42 @@ All settings can be configured via environment variables, ideal for CI/CD:
 
 ## CI/CD Integration
 
-### Azure Pipelines
+### GitHub Actions (for GitHub PRs)
+
+```yaml
+name: AI Code Review
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Copilot CLI and Berean
+        run: |
+          npm install -g @github/copilot
+          curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+          echo "$(npm prefix -g)/bin" >> $GITHUB_PATH
+
+      - name: Run AI Review
+        run: |
+          berean review "https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}" \
+            --post-comment --inline --skip-if-reviewed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEREAN_MODEL: gpt-4o
+```
+
+### Azure Pipelines (for Azure DevOps PRs)
 
 ```yaml
 trigger:
@@ -122,8 +178,8 @@ steps:
 
   - script: |
       npm install -g @github/copilot
-      git clone https://github.com/rajada1/berean.git /tmp/berean
-      cd /tmp/berean && npm install && npm link
+      curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+      echo "##vso[task.prependpath]$(npm prefix -g)/bin"
     displayName: 'Install Copilot CLI and Berean'
 
   - script: |
@@ -162,15 +218,16 @@ If using a manual PAT instead of `System.AccessToken`:
 ### GitHub Token Options
 
 1. **Fine-grained PAT** - Create at github.com → Settings → Developer settings → Fine-grained tokens
-   - No specific repository scope needed
-   - Just needs an active GitHub Copilot subscription on the account
+   - For GitHub PRs: needs repository read and pull request write permissions
+   - For Copilot only (Azure DevOps PRs): no specific repository scope needed
 
 2. **Classic PAT** - `ghp_` prefix
-   - Minimal scope: none (Copilot subscription is verified by account)
+   - For GitHub PRs: `repo` scope (or `public_repo` for public repositories)
+   - For Copilot only (Azure DevOps PRs): minimal scope (Copilot subscription verified by account)
 
 3. **OAuth token** - `gho_` or `ghu_` prefix (from a GitHub App)
 
-### GitHub Actions
+### GitHub Actions (for Azure DevOps PRs)
 
 ```yaml
 name: AI Code Review
@@ -190,10 +247,11 @@ jobs:
         with:
           node-version: '22'
 
-      - run: |
+      - name: Install Copilot CLI and Berean
+        run: |
           npm install -g @github/copilot
-          git clone https://github.com/rajada1/berean.git /tmp/berean
-          cd /tmp/berean && npm install && npm link
+          curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+          echo "$(npm prefix -g)/bin" >> $GITHUB_PATH
 
       - name: Run AI Review
         run: berean review "${{ inputs.pr_url }}" --post-comment --inline
@@ -201,6 +259,36 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
           BEREAN_MODEL: gpt-4o
+```
+
+### Azure Pipelines (for GitHub PRs)
+
+```yaml
+trigger:
+  - none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '22.x'
+
+  - script: |
+      npm install -g @github/copilot
+      curl -fsSL https://raw.githubusercontent.com/iatecbr/IATec.AI.WorkFlow.Review.Berean/main/install.sh | bash
+      echo "##vso[task.prependpath]$(npm prefix -g)/bin"
+    displayName: 'Install Copilot CLI and Berean'
+
+  - script: |
+      berean review "https://github.com/owner/repo/pull/$(System.PullRequest.PullRequestNumber)" \
+        --post-comment --inline --skip-if-reviewed
+    displayName: 'AI Code Review'
+    env:
+      GITHUB_TOKEN: $(GithubToken)
+      BEREAN_MODEL: claude-sonnet-4
+      BEREAN_LANGUAGE: English
 ```
 
 ---
@@ -221,6 +309,11 @@ berean auth status   # Check auth status
 berean review <url> [options]
 
 # Options:
+#   --owner <owner>       GitHub repository owner (for flag-based usage)
+#   --org <organization>  Azure DevOps organization (for flag-based usage)
+#   --project <project>   Azure DevOps project (for flag-based usage)
+#   --repo <repository>   Repository name
+#   --pr <id>             Pull Request ID
 #   --model <model>       AI model (overrides BEREAN_MODEL)
 #   --language <lang>     Response language (overrides BEREAN_LANGUAGE)
 #   --json                JSON output
@@ -230,6 +323,14 @@ berean review <url> [options]
 #   --incremental         Only review new commits
 #   --force               Force review even with @berean: ignore
 ```
+
+#### Supported PR URLs
+
+| Platform | URL Format |
+|----------|-----------|
+| **GitHub** | `https://github.com/{owner}/{repo}/pull/{number}` |
+| **Azure DevOps** | `https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}` |
+| **Azure DevOps** | `https://{org}.visualstudio.com/{project}/_git/{repo}/pullrequest/{id}` |
 
 ### `berean models`
 
@@ -246,8 +347,15 @@ berean models current   # Show current model
 berean config set azure-pat <token>      # Save Azure DevOps PAT
 berean config set default-model <model>  # Set default model
 berean config set language <lang>        # Set default language
+berean config set max-rules-chars <num>  # Set max rules characters
 berean config get                        # Show all config
 berean config path                       # Show config directory
+
+Example:
+
+```bash
+berean config set max-rules-chars 50000
+```
 ```
 
 ---

@@ -42,6 +42,11 @@ async function getCopilotToken(githubToken: string): Promise<string> {
 
   if (!response.ok) {
     const body = await response.text();
+    if (response.status === 403 && body.includes('Resource not accessible by personal access token')) {
+      throw new Error(
+        'Token exchange failed (403): the configured GitHub token is a personal access token, and this Copilot endpoint does not accept PATs. Remove GITHUB_TOKEN/GH_TOKEN/COPILOT_GITHUB_TOKEN and authenticate with `berean auth login`, or provide a GitHub token type that is allowed to exchange for a Copilot token.',
+      );
+    }
     throw new Error(`Token exchange failed (${response.status}): ${body}`);
   }
 
@@ -55,16 +60,23 @@ async function getCopilotToken(githubToken: string): Promise<string> {
 
 /**
  * Call Copilot Chat Completions API directly via HTTP
+ *
+ * @param githubToken GitHub PAT used to exchange for a Copilot token.
+ * @param model Copilot model identifier.
+ * @param systemPrompt System prompt content.
+ * @param userPrompt User prompt content.
+ * @param timeoutMs Timeout in milliseconds.
  */
 export async function chatCompletion(
   githubToken: string,
   model: string,
-  prompt: string,
+  systemPrompt: string,
+  userPrompt: string,
   timeoutMs: number = 300_000,
 ): Promise<string> {
   const copilotToken = await getCopilotToken(githubToken);
 
-  log(`[berean-http] Sending chat completion request (model: ${model}, prompt: ${prompt.length} chars)...`);
+  log(`[berean-http] Sending chat completion request (model: ${model}, system: ${systemPrompt.length} chars, user: ${userPrompt.length} chars)...`);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -82,7 +94,10 @@ export async function chatCompletion(
       },
       body: JSON.stringify({
         model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
         stream: false,
       }),
       signal: controller.signal,

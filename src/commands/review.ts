@@ -3,28 +3,30 @@ import chalk from 'chalk';
 import ora from 'ora';
 import * as path from 'path';
 import {
-  parsePRUrl,
-  fetchPRBasicInfo,
-  fetchPRDiff,
-  postPRComment,
-  postInlineComments,
-  PRInfo,
-  findBereanComments,
-  getPRCommits,
+  createProviderFromUrl,
+  createProviderFromFlags,
   shouldIgnorePR,
   addReviewedCommitsTag,
   addReviewedIterationTag,
-  updatePRComment,
-} from '../services/azure-devops.js';
+  type PRProvider,
+} from '../services/pr-provider.js';
 import { reviewCode, fetchModels, stopClient, generateRuleQueries, discoverNeededContext, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
 import { isAuthenticated } from '../services/copilot-auth.js';
-import { getAzureDevOpsPATFromPipeline, getDefaultModel, getDefaultLanguage, getRulesPath, getMemoryFilePath } from '../services/credentials.js';
+import { getDefaultModel, getDefaultLanguage, getRulesPath, getMemoryFilePath } from '../services/credentials.js';
 import { parseRuleSources, resolveRules } from '../services/rules.js';
+import { getModelMaxRulesChars } from '../services/model-limits.js';
 import { loadMemoryIndex, parseMemoryPointers, resolveTopicFiles } from '../services/memory.js';
+
+function log(msg: string): void {
+  if (process.env.BEREAN_VERBOSE) {
+    console.error(msg);
+  }
+}
 
 export const reviewCommand = new Command('review')
   .description('Review a Pull Request')
-  .argument('[url]', 'Azure DevOps PR URL')
+  .argument('[url]', 'Pull Request URL (GitHub or Azure DevOps)')
+  .option('--owner <owner>', 'GitHub repository owner')
   .option('--org <organization>', 'Azure DevOps organization')
   .option('--project <project>', 'Azure DevOps project')
   .option('--repo <repository>', 'Repository name')
@@ -38,6 +40,7 @@ export const reviewCommand = new Command('review')
   .option('--skip-if-reviewed', 'Skip if PR was already reviewed by Berean')
   .option('--incremental', 'Only review new commits since last Berean review')
   .option('--force', 'Force review even if @berean: ignore is set')
+  .option('--confidence-threshold <number>', 'Minimum confidence to report issues (0-100, default: 75)')
   .option(
     '--rules <sources>',
     'Comma-separated rule sources: file paths, directories, or URLs. ' +
@@ -73,39 +76,26 @@ export const reviewCommand = new Command('review')
         process.exit(1);
       }
 
-      // Check Azure DevOps PAT
-      if (!getAzureDevOpsPATFromPipeline()) {
-        console.log(chalk.red('✗ Azure DevOps PAT not configured.'));
-        console.log(chalk.gray('  Set AZURE_DEVOPS_PAT environment variable or run:'));
-        console.log(chalk.gray('  berean config set azure-pat <your-pat>'));
-        process.exit(1);
-      }
-
-      // Parse PR info
-      let prInfo: PRInfo | null = null;
+      // Resolve PR provider (GitHub or Azure DevOps)
+      let providerResult;
 
       if (url) {
-        prInfo = parsePRUrl(url);
-        if (!prInfo) {
-          console.log(chalk.red('✗ Invalid Azure DevOps PR URL'));
-          console.log(chalk.gray('  Expected format: https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}'));
-          process.exit(1);
-        }
-      } else if (options.org && options.project && options.repo && options.pr) {
-        prInfo = {
-          organization: options.org,
-          project: options.project,
-          repository: options.repo,
-          pullRequestId: parseInt(options.pr, 10),
-        };
+        providerResult = createProviderFromUrl(url);
       } else {
-        console.log(chalk.red('✗ Please provide a PR URL or use --org, --project, --repo, --pr flags'));
+        providerResult = createProviderFromFlags(options);
+      }
+
+      if (!providerResult.provider) {
+        console.log(chalk.red(`✗ ${providerResult.error}`));
         process.exit(1);
       }
+
+      const provider = providerResult.provider;
+      log(`[berean] Provider: ${provider.platform} (source: ${url ? 'url' : 'flags'})`);
 
       // ── 1. Lightweight PR details fetch (for @berean: ignore check) ──────────
       const infoSpinner = ora('Fetching PR info...').start();
-      const prBasicInfo = await fetchPRBasicInfo(prInfo);
+      const prBasicInfo = await provider.fetchPRBasicInfo();
 
       if (!prBasicInfo.success || !prBasicInfo.prDetails) {
         infoSpinner.fail('Failed to fetch PR info');
@@ -133,8 +123,8 @@ export const reviewCommand = new Command('review')
         const checkSpinner = ora('Checking for existing reviews...').start();
 
         const [bereanComments, prCommits] = await Promise.all([
-          findBereanComments(prInfo),
-          getPRCommits(prInfo),
+          provider.findBereanComments(),
+          provider.getPRCommits(),
         ]);
 
         allCommits = prCommits;
@@ -176,12 +166,10 @@ export const reviewCommand = new Command('review')
           }
         } else {
           checkSpinner.succeed('No previous Berean review found');
-          newCommits = allCommits;
         }
       } else {
         // Just get commits for tagging
-        allCommits = await getPRCommits(prInfo);
-        newCommits = allCommits;
+        allCommits = await provider.getPRCommits();
       }
 
       // ── 3. Fetch diff (incremental scope when applicable) ────────────────────
@@ -195,7 +183,7 @@ export const reviewCommand = new Command('review')
         ? (options.skipFolders as string).split(',').map((f: string) => f.trim()).filter(Boolean)
         : [];
 
-      const diffResult = await fetchPRDiff(prInfo, { fromIterationId, skipFolders });
+      const diffResult = await provider.fetchPRDiff({ fromIterationId, skipFolders });
 
       if (!diffResult.success || !diffResult.diff) {
         diffSpinner.fail('Failed to fetch PR diff');
@@ -209,7 +197,11 @@ export const reviewCommand = new Command('review')
           : `Diff fetched (${diffResult.diff.length} chars)`,
       );
 
-      // ── 5. Two-phase context discovery via MEMORY.md ──────────────────────────
+      if (diffResult.skippedFiles && diffResult.skippedFiles > 0) {
+        console.log(chalk.gray(`  ⏭️  ${diffResult.skippedFiles} file(s) skipped (--skip-folders: ${skipFolders.join(', ')})`));
+      }
+
+      // ── 4. Two-phase context discovery via MEMORY.md ──────────────────────────
       const language = options.language || getDefaultLanguage();
       const model = options.model || getDefaultModel();
 
@@ -251,25 +243,27 @@ export const reviewCommand = new Command('review')
         }
       }
 
-      // ── 6. Load project rules (after diff — URL sources need the diff for LLM queries) ──
+      // ── 5. Load project rules (after diff — URL sources need the diff for LLM queries) ──
 
       let rules: string | undefined;
       const rulesInput = options.rules || getRulesPath();
 
-      if (rulesInput) {
-        const rulesSpinner = ora('Loading project rules...').start();
-        try {
-          const sources = parseRuleSources(rulesInput);
-          const hasUrlSources = sources.some(s => s.type === 'url');
+        if (rulesInput) {
+          const rulesSpinner = ora('Loading project rules...').start();
+          try {
+            const sources = parseRuleSources(rulesInput);
+            const hasUrlSources = sources.some(s => s.type === 'url');
 
           if (hasUrlSources) {
             rulesSpinner.text = 'Loading project rules (fetching from URLs)...';
           }
 
+          const maxRulesCharsDefault = await getModelMaxRulesChars(model);
           const result = await resolveRules(
             sources,
             diffResult.diff,
             (d) => generateRuleQueries(d, model),
+            maxRulesCharsDefault,
           );
 
           if (result.rules) {
@@ -296,10 +290,17 @@ export const reviewCommand = new Command('review')
         }
       }
 
-      // ── 7. Review code ────────────────────────────────────────────────────────
+      // ── 5. Review code ────────────────────────────────────────────────────────
       const reviewSpinner = ora(`Reviewing with ${model}...`).start();
 
-      const reviewResult = await reviewCode(diffResult.diff, { model, language, rules, memoryIndex, topicFiles });
+      const reviewResult = await reviewCode(diffResult.diff, {
+        model,
+        language,
+        rules,
+        memoryIndex,
+        topicFiles,
+        confidenceThreshold: options.confidenceThreshold ? parseInt(options.confidenceThreshold, 10) : undefined,
+      });
 
       if (!reviewResult.success) {
         reviewSpinner.fail('Review failed');
@@ -309,27 +310,39 @@ export const reviewCommand = new Command('review')
 
       reviewSpinner.succeed('Review complete!');
 
-      // ── 8. Post comments ──────────────────────────────────────────────────────
+      // ── 6. Post comments ──────────────────────────────────────────────────────
+      let postFailed = false;
+
       if (options.postComment) {
-        await postGeneralComment(
-          prInfo,
+        const success = await postGeneralComment(
+          provider,
           reviewResult,
           allCommits,
           diffResult.currentIterationId,
           existingReview,
           options.incremental,
         );
+        if (!success) {
+          postFailed = true;
+        }
       }
 
-      if (options.inline) {
-        await postInlineIssues(prInfo, reviewResult);
+      if (options.inline && !postFailed) {
+        const success = await postInlineIssues(provider, reviewResult);
+        if (!success) {
+          postFailed = true;
+        }
       }
 
-      // ── 9. Output ─────────────────────────────────────────────────────────────
+      // ── 7. Output ─────────────────────────────────────────────────────────────
       if (options.json) {
         console.log(JSON.stringify(reviewResult, null, 2));
       } else {
         printReviewToTerminal(reviewResult);
+      }
+
+      if (postFailed) {
+        process.exitCode = 1;
       }
     } finally {
       await stopClient();
@@ -339,13 +352,13 @@ export const reviewCommand = new Command('review')
 // ─── Comment helpers ──────────────────────────────────────────────────────────
 
 async function postGeneralComment(
-  prInfo: PRInfo,
+  provider: PRProvider,
   reviewResult: ReviewResult,
   commitIds: string[] = [],
   currentIterationId: number | undefined,
   existingReview: { threadId: number; commentId: number; content: string } | null = null,
   incremental = false,
-) {
+): Promise<boolean> {
   const spinner = ora('Posting review comment to PR...').start();
 
   // Build the new review markdown
@@ -364,20 +377,24 @@ async function postGeneralComment(
   if (incremental && existingReview) {
     // Preserve the previous review inside a collapsible <details> block
     const fullComment = buildIncrementalComment(newComment, existingReview.content);
-    result = await updatePRComment(prInfo, existingReview.threadId, existingReview.commentId, fullComment);
+    result = await provider.updatePRComment(existingReview.threadId, existingReview.commentId, fullComment);
     if (result.success) {
       spinner.succeed('Updated existing review comment with new findings!');
     } else {
-      spinner.fail(`Failed to update comment: ${result.error}`);
+      spinner.fail('Failed to update comment');
+      console.log(chalk.red(`  ${result.error}`));
     }
   } else {
-    result = await postPRComment(prInfo, newComment);
+    result = await provider.postPRComment(newComment);
     if (result.success) {
       spinner.succeed('Review posted to PR!');
     } else {
-      spinner.fail(`Failed to post comment: ${result.error}`);
+      spinner.fail('Failed to post comment');
+      console.log(chalk.red(`  ${result.error}`));
     }
   }
+
+  return result.success;
 }
 
 /**
@@ -399,12 +416,12 @@ function buildIncrementalComment(newContent: string, previousContent: string): s
   );
 }
 
-async function postInlineIssues(prInfo: PRInfo, reviewResult: ReviewResult) {
+async function postInlineIssues(provider: PRProvider, reviewResult: ReviewResult): Promise<boolean> {
   const inlineIssues = (reviewResult.issues ?? []).filter(i => i.file && i.line);
 
   if (inlineIssues.length === 0) {
     console.log(chalk.yellow('  No issues with file/line info for inline comments'));
-    return;
+    return true;
   }
 
   const spinner = ora(`Posting ${inlineIssues.length} inline comments...`).start();
@@ -415,20 +432,23 @@ async function postInlineIssues(prInfo: PRInfo, reviewResult: ReviewResult) {
     content: formatIssueAsMarkdown(issue),
   }));
 
-  const result = await postInlineComments(prInfo, comments);
+  const result = await provider.postInlineComments(comments);
 
   if (result.failed === 0) {
     spinner.succeed(`Posted ${result.success} inline comments!`);
+    return true;
   } else if (result.success > 0) {
     spinner.warn(`Posted ${result.success} comments, ${result.failed} failed`);
     for (const err of result.errors.slice(0, 3)) {
       console.log(chalk.gray(`    ${err}`));
     }
+    return false;
   } else {
     spinner.fail(`Failed to post inline comments`);
     for (const err of result.errors.slice(0, 3)) {
       console.log(chalk.red(`    ${err}`));
     }
+    return false;
   }
 }
 
@@ -439,6 +459,17 @@ function formatReviewAsMarkdown(reviewResult: ReviewResult): string {
 
   if (reviewResult.summary) {
     md += `### Summary\n${reviewResult.summary}\n\n`;
+  }
+
+  if (reviewResult.recommendation) {
+    const recEmoji: Record<string, string> = {
+      'APPROVE': '✅',
+      'APPROVE_WITH_SUGGESTIONS': '✅💡',
+      'NEEDS_CHANGES': '⚠️',
+      'NEEDS_DISCUSSION': '💬'
+    };
+    const emoji = recEmoji[reviewResult.recommendation] || '📋';
+    md += `### ${emoji} Recommendation: ${reviewResult.recommendation.replace(/_/g, ' ')}\n\n`;
   }
 
   if (reviewResult.issues && reviewResult.issues.length > 0) {
@@ -513,8 +544,12 @@ function renderIssueMarkdown(issue: ReviewIssue): string {
   const icon = issue.severity === 'critical' ? '🔴' : issue.severity === 'warning' ? '🟡' : '🔵';
 
   let md = `${icon} **${issue.severity.toUpperCase()}**`;
+  if (issue.category) md += ` [${issue.category}]`;
+  if (issue.confidence) md += ` (${issue.confidence}%)`;
   if (issue.line) md += ` — linha ${issue.line}`;
-  md += `\n${issue.message}\n`;
+  md += '\n';
+  if (issue.title) md += `**${issue.title}**\n`;
+  md += `${issue.message}\n`;
 
   if (issue.suggestion) {
     md += `\n\`\`\`suggestion\n${issue.suggestion}\n\`\`\`\n`;
@@ -526,7 +561,14 @@ function renderIssueMarkdown(issue: ReviewIssue): string {
 
 function formatIssueAsMarkdown(issue: ReviewIssue): string {
   const icon = issue.severity === 'critical' ? '🔴' : issue.severity === 'warning' ? '🟡' : '🔵';
-  let md = `${icon} **${issue.severity.toUpperCase()}**: ${issue.message}`;
+
+  let md = `${icon} **${issue.severity.toUpperCase()}**`;
+  if (issue.category) md += ` [${issue.category}]`;
+  if (issue.confidence) md += ` (${issue.confidence}%)`;
+  md += '\n';
+  if (issue.title) md += `**${issue.title}**\n`;
+  md += issue.message;
+
   if (issue.suggestion) {
     md += `\n\n\`\`\`suggestion\n${issue.suggestion}\n\`\`\``;
   }
@@ -541,6 +583,24 @@ function printReviewToTerminal(reviewResult: ReviewResult) {
   if (reviewResult.summary) {
     console.log(chalk.white.bold('Summary:'));
     console.log(chalk.white(reviewResult.summary) + '\n');
+  }
+
+  if (reviewResult.recommendation) {
+    const recColors: Record<string, (text: string) => string> = {
+      'APPROVE': chalk.green,
+      'APPROVE_WITH_SUGGESTIONS': chalk.green,
+      'NEEDS_CHANGES': chalk.yellow,
+      'NEEDS_DISCUSSION': chalk.cyan
+    };
+    const recEmoji: Record<string, string> = {
+      'APPROVE': '✅',
+      'APPROVE_WITH_SUGGESTIONS': '✅💡',
+      'NEEDS_CHANGES': '⚠️',
+      'NEEDS_DISCUSSION': '💬'
+    };
+    const colorFn = recColors[reviewResult.recommendation] || chalk.white;
+    const emoji = recEmoji[reviewResult.recommendation] || '📋';
+    console.log(colorFn(`${emoji} Recommendation: ${reviewResult.recommendation.replace(/_/g, ' ')}\n`));
   }
 
   if (reviewResult.issues && reviewResult.issues.length > 0) {
@@ -566,8 +626,18 @@ function printReviewToTerminal(reviewResult: ReviewResult) {
           ? ['🟡', chalk.yellow]
           : ['🔵', chalk.blue];
 
-      console.log(`${icon} ${color.bold(issue.severity.toUpperCase())}`);
+      let header = `${icon} ${color.bold(issue.severity.toUpperCase())}`;
+      if (issue.category) {
+        header += chalk.gray(` [${issue.category}]`);
+      }
+      if (issue.confidence) {
+        header += chalk.gray(` (${issue.confidence}%)`);
+      }
+      console.log(header);
       if (issue.file) console.log(chalk.gray(`   ${issue.file}${issue.line ? `:${issue.line}` : ''}`));
+      if (issue.title) {
+        console.log(chalk.white.bold(`   ${issue.title}`));
+      }
       console.log(chalk.white(`   ${issue.message}`));
       if (issue.suggestion) console.log(chalk.green(`   Suggestion: ${issue.suggestion}`));
       console.log();
