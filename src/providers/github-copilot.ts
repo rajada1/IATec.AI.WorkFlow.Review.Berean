@@ -26,6 +26,10 @@ export interface ReviewOptions {
   language?: string;
   maxTokens?: number;
   rules?: string;
+  /** Raw content of the MEMORY.md index, used for Phase 1 context discovery */
+  memoryIndex?: string;
+  /** Topic file contents resolved from Phase 1, keyed by topic label */
+  topicFiles?: Record<string, string>;
 }
 
 // ─── Verbose logger ───────────────────────────────────────────────────────────
@@ -66,12 +70,12 @@ export async function stopClient(): Promise<void> {
 // ─── Review ───────────────────────────────────────────────────────────────────
 
 export async function reviewCode(diff: string, options: ReviewOptions = {}): Promise<ReviewResult> {
-  const { model = 'gpt-4o', language = 'English', rules } = options;
+  const { model = 'gpt-4o', language = 'English', rules, topicFiles } = options;
 
   try {
     const client = await getClient();
 
-    const systemPrompt = buildReviewPrompt(language, rules);
+    const systemPrompt = buildReviewPrompt(language, rules, topicFiles);
     const prompt = `${systemPrompt}\n\n---\n\nHere is the code diff to review:\n\n${diff}`;
 
     log(`[berean] Token source: ${getGitHubTokenFromAzure() ? 'env var' : 'SDK default'}`);
@@ -199,7 +203,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
     ) {
       log(`[berean] SDK failed (${errMsg}), falling back to direct HTTP API...`);
       try {
-        const systemPromptFallback = buildReviewPrompt(options.language ?? 'English', options.rules);
+        const systemPromptFallback = buildReviewPrompt(options.language ?? 'English', options.rules, options.topicFiles);
         const promptFallback = `${systemPromptFallback}\n\n---\n\nHere is the code diff to review:\n\n${diff}`;
         const content = await chatCompletion(token, model, promptFallback, 300_000);
         if (content) return parseReviewResponse(content, model);
@@ -276,7 +280,7 @@ function parseReviewResponse(content: string, model: string): ReviewResult {
 
 // ─── Prompt ───────────────────────────────────────────────────────────────────
 
-function buildReviewPrompt(language: string, rules?: string): string {
+function buildReviewPrompt(language: string, rules?: string, topicFiles?: Record<string, string>): string {
   let prompt = `You are an expert code reviewer. Analyze the provided code changes (git diff) and provide a comprehensive review.
 
 You MUST respond with ONLY a valid JSON object (no markdown, no code blocks, no extra text). The JSON must contain:
@@ -314,7 +318,75 @@ Be specific and actionable. If the code is good, return empty issues array and l
     prompt += `\n\n---\n\nPROJECT-SPECIFIC RULES AND GUIDELINES (use these to evaluate the code):\n\n${rules}`;
   }
 
+  if (topicFiles && Object.keys(topicFiles).length > 0) {
+    const sections = Object.entries(topicFiles)
+      .map(([topic, content]) => `### ${topic}\n\n${content}`)
+      .join('\n\n---\n\n');
+    prompt += `\n\n---\n\n## Project Context (from memory)\n\nThe following topic files were identified as relevant to this review:\n\n${sections}`;
+  }
+
   return prompt;
+}
+
+// ─── Context discovery (Phase 1) ──────────────────────────────────────────────
+
+/**
+ * Phase 1 of the two-phase agentic review.
+ *
+ * Sends the diff + MEMORY.md index to the model and asks it to identify
+ * which topic files are most relevant to review.  Returns a list of relative
+ * paths (as listed in MEMORY.md) to load for Phase 2.
+ *
+ * Uses the HTTP path exclusively (fast 30 s call).  On any failure returns [].
+ */
+export async function discoverNeededContext(
+  diff: string,
+  memoryIndex: string,
+  model: string,
+): Promise<string[]> {
+  const token = getGitHubTokenFromAzure();
+  if (!token) return [];
+
+  const prompt = `You are helping prepare a code review. Below is:
+1. A MEMORY.md index listing project documentation files
+2. A code diff to be reviewed
+
+Based on the diff, identify which topic files from the MEMORY.md index would provide the most useful context for a thorough code review.
+
+Respond with ONLY a valid JSON object — no markdown, no explanation.
+Format: { "needed_files": ["relative/path1.md", "relative/path2.md"] }
+Return at most 5 files. If no files are relevant, return: { "needed_files": [] }
+
+MEMORY.md INDEX:
+${memoryIndex.substring(0, 3_000)}
+
+CODE DIFF (excerpt):
+${diff.substring(0, 2_000)}`;
+
+  try {
+    const content = await chatCompletion(token, model, prompt, 30_000);
+    if (!content) return [];
+
+    // Extract JSON object from response
+    const match = content.match(/\{[\s\S]*?\}/);
+    if (!match) return [];
+
+    const parsed = JSON.parse(match[0]) as unknown;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      'needed_files' in parsed &&
+      Array.isArray((parsed as Record<string, unknown>).needed_files)
+    ) {
+      return ((parsed as { needed_files: unknown[] }).needed_files)
+        .filter((f): f is string => typeof f === 'string')
+        .slice(0, 5);
+    }
+  } catch (e) {
+    log(`[berean] discoverNeededContext failed: ${e instanceof Error ? e.message : e}`);
+  }
+
+  return [];
 }
 
 // ─── Rule query generation ────────────────────────────────────────────────────

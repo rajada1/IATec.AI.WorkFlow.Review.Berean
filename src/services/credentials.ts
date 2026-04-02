@@ -92,6 +92,20 @@ export function getRulesPath(): string | null {
 }
 
 /**
+ * Get memory index file path from env or auto-discover local MEMORY.md.
+ * Priority: BEREAN_MEMORY → BEREANMEMORY → ./MEMORY.md (if it exists) → null
+ */
+export function getMemoryFilePath(): string | null {
+  const envPath = process.env.BEREAN_MEMORY || process.env.BEREANMEMORY;
+  if (envPath) return envPath;
+
+  const localMemory = path.join(process.cwd(), 'MEMORY.md');
+  if (fs.existsSync(localMemory)) return localMemory;
+
+  return null;
+}
+
+/**
  * Get GitHub token - also checks Azure DevOps common variable names
  */
 export function getGitHubTokenFromAzure(): string | null {

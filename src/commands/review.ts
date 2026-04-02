@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import * as path from 'path';
 import {
   parsePRUrl,
   fetchPRBasicInfo,
@@ -15,10 +16,11 @@ import {
   addReviewedIterationTag,
   updatePRComment,
 } from '../services/azure-devops.js';
-import { reviewCode, fetchModels, stopClient, generateRuleQueries, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
+import { reviewCode, fetchModels, stopClient, generateRuleQueries, discoverNeededContext, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
 import { isAuthenticated } from '../services/copilot-auth.js';
-import { getAzureDevOpsPATFromPipeline, getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/credentials.js';
+import { getAzureDevOpsPATFromPipeline, getDefaultModel, getDefaultLanguage, getRulesPath, getMemoryFilePath } from '../services/credentials.js';
 import { parseRuleSources, resolveRules } from '../services/rules.js';
+import { loadMemoryIndex, parseMemoryPointers, resolveTopicFiles } from '../services/memory.js';
 
 export const reviewCommand = new Command('review')
   .description('Review a Pull Request')
@@ -41,6 +43,11 @@ export const reviewCommand = new Command('review')
     'Comma-separated rule sources: file paths, directories, or URLs. ' +
     'URLs with {{query}} are queried dynamically by the LLM. ' +
     'E.g.: ./rules.md,https://host/doc?q={{query}} (or set BEREAN_RULES env)',
+  )
+  .option(
+    '--memory <path>',
+    'Path to MEMORY.md index file for two-phase context discovery (or set BEREAN_MEMORY env). ' +
+    'Auto-discovered if ./MEMORY.md exists.',
   )
   .option(
     '--skip-folders <folders>',
@@ -202,9 +209,49 @@ export const reviewCommand = new Command('review')
           : `Diff fetched (${diffResult.diff.length} chars)`,
       );
 
-      // ── 4. Load project rules (after diff — URL sources need the diff for LLM queries) ──
+      // ── 5. Two-phase context discovery via MEMORY.md ──────────────────────────
       const language = options.language || getDefaultLanguage();
       const model = options.model || getDefaultModel();
+
+      let memoryIndex: string | undefined;
+      let topicFiles: Record<string, string> | undefined;
+
+      const memoryPath = options.memory || getMemoryFilePath();
+      if (memoryPath) {
+        const memoryIndexContent = loadMemoryIndex(memoryPath);
+        if (memoryIndexContent) {
+          const baseDir = path.dirname(path.resolve(memoryPath));
+          const pointers = parseMemoryPointers(memoryIndexContent, baseDir);
+          const memorySpinner = ora(
+            `Memory index loaded (${pointers.length} pointer${pointers.length !== 1 ? 's' : ''}) — discovering context...`,
+          ).start();
+
+          try {
+            const neededPaths = await discoverNeededContext(diffResult.diff, memoryIndexContent, model);
+
+            if (neededPaths.length > 0) {
+              topicFiles = resolveTopicFiles(pointers, neededPaths);
+              const loadedTopics = Object.keys(topicFiles);
+              if (loadedTopics.length > 0) {
+                memorySpinner.succeed(
+                  `Context: loaded ${loadedTopics.length} topic file${loadedTopics.length !== 1 ? 's' : ''} (${loadedTopics.join(', ')})`,
+                );
+                memoryIndex = memoryIndexContent;
+              } else {
+                memorySpinner.succeed('Memory index scanned — no matching topic files found');
+              }
+            } else {
+              memorySpinner.succeed('Memory index scanned — no additional context needed');
+            }
+          } catch (memErr) {
+            memorySpinner.warn(
+              `Memory context discovery failed: ${memErr instanceof Error ? memErr.message : 'Unknown error'} (continuing without extra context)`,
+            );
+          }
+        }
+      }
+
+      // ── 6. Load project rules (after diff — URL sources need the diff for LLM queries) ──
 
       let rules: string | undefined;
       const rulesInput = options.rules || getRulesPath();
@@ -249,10 +296,10 @@ export const reviewCommand = new Command('review')
         }
       }
 
-      // ── 5. Review code ────────────────────────────────────────────────────────
+      // ── 7. Review code ────────────────────────────────────────────────────────
       const reviewSpinner = ora(`Reviewing with ${model}...`).start();
 
-      const reviewResult = await reviewCode(diffResult.diff, { model, language, rules });
+      const reviewResult = await reviewCode(diffResult.diff, { model, language, rules, memoryIndex, topicFiles });
 
       if (!reviewResult.success) {
         reviewSpinner.fail('Review failed');
@@ -262,7 +309,7 @@ export const reviewCommand = new Command('review')
 
       reviewSpinner.succeed('Review complete!');
 
-      // ── 6. Post comments ──────────────────────────────────────────────────────
+      // ── 8. Post comments ──────────────────────────────────────────────────────
       if (options.postComment) {
         await postGeneralComment(
           prInfo,
@@ -278,7 +325,7 @@ export const reviewCommand = new Command('review')
         await postInlineIssues(prInfo, reviewResult);
       }
 
-      // ── 7. Output ─────────────────────────────────────────────────────────────
+      // ── 9. Output ─────────────────────────────────────────────────────────────
       if (options.json) {
         console.log(JSON.stringify(reviewResult, null, 2));
       } else {
