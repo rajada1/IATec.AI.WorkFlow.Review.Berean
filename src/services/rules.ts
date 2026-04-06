@@ -13,6 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import { getMaxRulesChars } from './credentials.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -48,6 +49,19 @@ const MAX_URL_RESPONSE_CHARS = 3_000;
 
 /** Timeout (ms) per HTTP fetch */
 const URL_TIMEOUT_MS = 12_000;
+
+// ─── Built-in rules ───────────────────────────────────────────────────────────
+
+/**
+ * Returns the absolute path to the built-in rules directory (src/rules).
+ * This directory contains SECURITY_INSTRUCTIONS.md and is automatically
+ * included in every code review.
+ */
+export function getBuiltInRulesPath(): string {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const projectRoot = path.resolve(__dirname, '..', '..');
+  return path.resolve(projectRoot, 'src', 'rules');
+}
 
 // ─── Parsing ──────────────────────────────────────────────────────────────────
 
