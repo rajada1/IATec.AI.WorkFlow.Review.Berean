@@ -427,7 +427,14 @@ function formatReviewAsMarkdown(reviewResult: ReviewResult): string {
     md += '### Issues Found\n\n';
     md += formatIssuesGroupedByFile(reviewResult.issues);
   } else if (!reviewResult.summary && reviewResult.review) {
-    md += reviewResult.review + '\n\n';
+    // Safety net: only show raw review content if it looks like a structured review (contains JSON).
+    // If the content is just model "thinking" text (not JSON), show a fallback message instead.
+    const reviewText = reviewResult.review.trim();
+    if (reviewText.startsWith('{') || reviewText.includes('"summary"') || reviewText.includes('"issues"')) {
+      md += reviewResult.review + '\n\n';
+    } else {
+      md += '⚠️ **Review could not be parsed.** The AI model returned a non-structured response. Please re-run the review.\n\n';
+    }
   } else {
     md += '✅ **No issues found!** Code looks good.\n\n';
   }

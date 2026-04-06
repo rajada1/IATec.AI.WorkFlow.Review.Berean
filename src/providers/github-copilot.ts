@@ -116,15 +116,33 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
       });
 
       content = await new Promise<string>((resolve, reject) => {
-        let result = '';
+        const messages: string[] = [];
         let gotMessage = false;
         let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
+        // Pick the best captured message: prefer JSON-like content over plain text
+        const pickBestMessage = (): string => {
+          // First pass: prefer a message that starts with '{'
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].trimStart().startsWith('{')) return messages[i];
+          }
+          // Second pass: prefer a message that contains '{' (JSON may be embedded)
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].includes('{')) return messages[i];
+          }
+          // Fallback: last message received
+          return messages[messages.length - 1] || '';
+        };
+
+        function gotJsonLikeMessage(): boolean {
+          return messages.some(m => m.trimStart().startsWith('{'));
+        }
+
         const timeoutId = setTimeout(() => {
           unsubscribe();
-          if (gotMessage && result) {
-            log(`[berean] Timeout reached but got response, using it`);
-            resolve(result);
+          if (gotMessage && messages.length > 0) {
+            log(`[berean] Timeout reached but got response, using best of ${messages.length} message(s)`);
+            resolve(pickBestMessage());
           } else {
             reject(new Error(`No response received after ${TIMEOUT_MS / 1000}s`));
           }
@@ -132,14 +150,17 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
 
         const settle = () => {
           if (settleTimer) clearTimeout(settleTimer);
+          // Use shorter settle time if we already have JSON-like content, longer if we only have thinking text
+          const delay = gotJsonLikeMessage() ? 5_000 : 15_000;
           settleTimer = setTimeout(() => {
-            if (result) {
+            if (messages.length > 0) {
               clearTimeout(timeoutId);
               unsubscribe();
-              log(`[berean] Response settled (no new events for 5s)`);
-              resolve(result);
+              const best = pickBestMessage();
+              log(`[berean] Response settled (no new events for ${delay / 1000}s), picked best of ${messages.length} message(s)`);
+              resolve(best);
             }
-          }, 5_000);
+          }, delay);
         };
 
         const unsubscribe = session.on((event: Record<string, unknown>) => {
@@ -148,7 +169,11 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
 
           if (eventType === 'assistant.message') {
             const data = event.data as Record<string, unknown>;
-            result = (data?.content as string) ?? result;
+            const msgContent = data?.content as string;
+            if (msgContent) {
+              messages.push(msgContent);
+              log(`[berean] Message #${messages.length} received (${msgContent.length} chars, json-like: ${msgContent.trimStart().startsWith('{')})`);
+            }
             gotMessage = true;
             settle();
           } else if (eventType === 'session.idle') {
@@ -156,7 +181,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
             clearTimeout(timeoutId);
             unsubscribe();
             log(`[berean] session.idle received`);
-            resolve(result);
+            resolve(pickBestMessage());
           } else if (eventType === 'session.error') {
             if (settleTimer) clearTimeout(settleTimer);
             clearTimeout(timeoutId);
@@ -186,12 +211,14 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
       content = await chatCompletion(token, model, system, user, TIMEOUT_MS);
     }
 
-    if (!content) {
-      // SDK returned empty — try direct HTTP as fallback
+    if (!content || !looksLikeReviewJson(content)) {
+      // SDK returned empty or non-JSON (e.g. model "thinking" text) — try direct HTTP as fallback
       const token = getGitHubTokenFromAzure();
       if (token) {
-        log(`[berean] SDK returned empty, trying direct HTTP API...`);
-        content = await chatCompletion(token, model, system, user, TIMEOUT_MS);
+        const reason = !content ? 'empty' : 'non-JSON (possible model thinking text)';
+        log(`[berean] SDK returned ${reason}, trying direct HTTP API...`);
+        const httpContent = await chatCompletion(token, model, system, user, TIMEOUT_MS);
+        if (httpContent) content = httpContent;
       }
     }
 
@@ -250,37 +277,22 @@ function parseReviewResponse(content: string, model: string, reviewScope: Review
       jsonContent = jsonMatch[1].trim();
     }
 
-    let parsed: {
+    type ParsedReview = {
       summary?: string;
       recommendation?: ReviewResult['recommendation'];
       issues?: ReviewResult['issues'];
       positives?: string[];
       recommendations?: string[];
-    } | null = null;
+    };
 
-    try {
-      parsed = JSON.parse(jsonContent);
-    } catch {
-      // Try to fix truncated JSON
-      let fixedJson = jsonContent;
+    let parsed: ParsedReview | null = null;
 
-      const openBraces = (fixedJson.match(/{/g) ?? []).length;
-      const closeBraces = (fixedJson.match(/}/g) ?? []).length;
-      const openBrackets = (fixedJson.match(/\[/g) ?? []).length;
-      const closeBrackets = (fixedJson.match(/\]/g) ?? []).length;
+    parsed = tryParseJson(jsonContent);
 
-      fixedJson = fixedJson.replace(/,\s*"[^"]*$/, '');
-      fixedJson = fixedJson.replace(/,\s*$/, '');
-      fixedJson = fixedJson.replace(/:\s*"[^"]*$/, ': ""');
-
-      for (let i = 0; i < openBrackets - closeBrackets; i++) fixedJson += ']';
-      for (let i = 0; i < openBraces - closeBraces; i++) fixedJson += '}';
-
-      try {
-        parsed = JSON.parse(fixedJson);
-      } catch {
-        // Still failed — return raw
-      }
+    // If direct parsing failed, try to extract a JSON object from within the text.
+    // This handles cases where the model prepends thinking/reasoning text before the JSON.
+    if (!parsed) {
+      parsed = extractJsonFromMixedContent(content);
     }
 
     if (parsed) {
@@ -296,10 +308,79 @@ function parseReviewResponse(content: string, model: string, reviewScope: Review
       };
     }
 
+    log(`[berean] ⚠ Could not parse review response as JSON (${content.length} chars). Content starts with: "${content.substring(0, 120)}..."`);
     return { success: true, review: content, model };
   } catch {
     return { success: true, review: content, model };
   }
+}
+
+/**
+ * Try to parse a string as JSON, with automatic repair for truncated responses.
+ */
+function tryParseJson(text: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Try to fix truncated JSON
+    let fixedJson = text;
+
+    const openBraces = (fixedJson.match(/{/g) ?? []).length;
+    const closeBraces = (fixedJson.match(/}/g) ?? []).length;
+    const openBrackets = (fixedJson.match(/\[/g) ?? []).length;
+    const closeBrackets = (fixedJson.match(/\]/g) ?? []).length;
+
+    fixedJson = fixedJson.replace(/,\s*"[^"]*$/, '');
+    fixedJson = fixedJson.replace(/,\s*$/, '');
+    fixedJson = fixedJson.replace(/:\s*"[^"]*$/, ': ""');
+
+    for (let i = 0; i < openBrackets - closeBrackets; i++) fixedJson += ']';
+    for (let i = 0; i < openBraces - closeBraces; i++) fixedJson += '}';
+
+    try {
+      return JSON.parse(fixedJson);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Extract a JSON object from mixed content where the model may have prepended
+ * thinking/reasoning text before the actual JSON response.
+ * Searches for `{` characters and attempts to parse from each position.
+ */
+function extractJsonFromMixedContent(content: string): Record<string, unknown> | null {
+  let searchFrom = 0;
+  while (searchFrom < content.length) {
+    const braceIndex = content.indexOf('{', searchFrom);
+    if (braceIndex === -1) break;
+
+    const candidate = content.substring(braceIndex);
+    const result = tryParseJson(candidate);
+    if (result && typeof result === 'object' && !Array.isArray(result) && ('summary' in result || 'issues' in result || 'recommendation' in result)) {
+      log(`[berean] Extracted JSON from mixed content at position ${braceIndex}`);
+      return result;
+    }
+
+    searchFrom = braceIndex + 1;
+  }
+  return null;
+}
+
+/**
+ * Check if content looks like it could be valid review JSON (or contains JSON).
+ * Used to decide whether to fall back to HTTP API.
+ */
+function looksLikeReviewJson(content: string): boolean {
+  const trimmed = content.trim();
+  // Direct JSON object
+  if (trimmed.startsWith('{')) return true;
+  // JSON inside markdown code block
+  if (trimmed.includes('```json') || trimmed.includes('```\n{')) return true;
+  // Contains a JSON-like structure with expected review fields
+  if (trimmed.includes('"summary"') && trimmed.includes('"recommendation"')) return true;
+  return false;
 }
 
 // ─── Prompt ───────────────────────────────────────────────────────────────────
