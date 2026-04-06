@@ -12,7 +12,7 @@ import {
 import { reviewCode, fetchModels, stopClient, generateRuleQueries, ReviewResult, ReviewIssue } from '../providers/github-copilot.js';
 import { isAuthenticated } from '../services/copilot-auth.js';
 import { getDefaultModel, getDefaultLanguage, getRulesPath } from '../services/credentials.js';
-import { parseRuleSources, resolveRules } from '../services/rules.js';
+import { parseRuleSources, resolveRules, getBuiltInRulesPath } from '../services/rules.js';
 import { getModelMaxRulesChars } from '../services/model-limits.js';
 
 function log(msg: string): void {
@@ -199,9 +199,13 @@ export const reviewCommand = new Command('review')
       const model = options.model || getDefaultModel();
 
       let rules: string | undefined;
-      const rulesInput = options.rules || getRulesPath();
+      const userRulesInput = options.rules || getRulesPath();
+      const builtInRulesPath = getBuiltInRulesPath();
+      const rulesInput = userRulesInput
+        ? `${builtInRulesPath},${userRulesInput}`
+        : builtInRulesPath;
 
-        if (rulesInput) {
+        {
           const rulesSpinner = ora('Loading project rules...').start();
           try {
             const sources = parseRuleSources(rulesInput);
