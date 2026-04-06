@@ -172,7 +172,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
             const msgContent = data?.content as string;
             if (msgContent) {
               messages.push(msgContent);
-              log(`[berean] Message #${messages.length} received (${msgContent.length} chars, json-like: ${msgContent.trimStart().startsWith('{')})`)
+              log(`[berean] Message #${messages.length} received (${msgContent.length} chars, json-like: ${msgContent.trimStart().startsWith('{')})`);
             }
             gotMessage = true;
             settle();
@@ -358,7 +358,7 @@ function extractJsonFromMixedContent(content: string): Record<string, unknown> |
 
     const candidate = content.substring(braceIndex);
     const result = tryParseJson(candidate);
-    if (result && typeof result === 'object' && ('summary' in result || 'issues' in result || 'recommendation' in result)) {
+    if (result && typeof result === 'object' && !Array.isArray(result) && ('summary' in result || 'issues' in result || 'recommendation' in result)) {
       log(`[berean] Extracted JSON from mixed content at position ${braceIndex}`);
       return result;
     }
