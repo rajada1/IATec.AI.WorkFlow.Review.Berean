@@ -266,7 +266,18 @@ export const reviewCommand = new Command('review')
       reviewSpinner.succeed('Review complete!');
 
       // ── 6. Post comments ──────────────────────────────────────────────────────
+      // Inline comments are posted FIRST so that improvement suggestions appear
+      // on the PR before the summary comment (which is always posted last).
+      // Both types are posted independently so a failure in one does not block
+      // the other.
       let postFailed = false;
+
+      if (options.inline) {
+        const success = await postInlineIssues(provider, reviewResult);
+        if (!success) {
+          postFailed = true;
+        }
+      }
 
       if (options.postComment) {
         const success = await postGeneralComment(
@@ -277,13 +288,6 @@ export const reviewCommand = new Command('review')
           existingReview,
           options.incremental,
         );
-        if (!success) {
-          postFailed = true;
-        }
-      }
-
-      if (options.inline && !postFailed) {
-        const success = await postInlineIssues(provider, reviewResult);
         if (!success) {
           postFailed = true;
         }

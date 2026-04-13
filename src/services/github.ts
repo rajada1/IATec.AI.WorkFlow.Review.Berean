@@ -268,6 +268,43 @@ export async function fetchGitHubPRDiff(
       page++;
     }
 
+    // ── 2b. Fallback: fetch unified diff when per-file patches are missing ───
+    // GitHub may omit the `patch` field for large PRs or files exceeding the
+    // diff size threshold. In that case, request the full unified diff via the
+    // diff media-type and back-fill missing patches.
+    const nonDeletedFiles = allFiles.filter(f => f.status !== 'removed');
+    const filesWithPatch = nonDeletedFiles.filter(f => f.patch);
+
+    if (nonDeletedFiles.length > 0 && filesWithPatch.length < nonDeletedFiles.length) {
+      log(`[berean] ${nonDeletedFiles.length - filesWithPatch.length} file(s) missing patch data — fetching unified diff as fallback`);
+      try {
+        const diffUrl = `https://api.github.com/repos/${encodeURIComponent(prInfo.owner)}/${encodeURIComponent(prInfo.repo)}/pulls/${prInfo.pullNumber}`;
+        logRequest('GET', `${diffUrl} (Accept: diff)`);
+        const diffRes = await fetch(diffUrl, {
+          headers: { ...ctx.headers, Accept: 'application/vnd.github.v3.diff' },
+        });
+
+        if (diffRes.ok) {
+          const rawDiff = await diffRes.text();
+          const patchMap = parseUnifiedDiff(rawDiff);
+          let supplemented = 0;
+
+          for (const file of allFiles) {
+            if (!file.patch && patchMap.has(file.filename)) {
+              file.patch = patchMap.get(file.filename);
+              supplemented++;
+            }
+          }
+
+          if (supplemented > 0) {
+            log(`[berean] Supplemented ${supplemented} file(s) with patches from unified diff`);
+          }
+        }
+      } catch (e) {
+        log(`[berean] Unified diff fallback failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+
     // ── 3. Apply skip-folders filter ──────────────────────────────────────────
     const { skipFolders = [] } = options;
     let skippedFiles = 0;
@@ -364,6 +401,50 @@ function isPathInSkippedFolder(filePath: string, skipFolders: string[]): boolean
     const n = normalised.toLowerCase();
     return n === f || n.startsWith(f + '/');
   });
+}
+
+// ─── Unified diff parsing ─────────────────────────────────────────────────────
+
+/**
+ * Parse a raw unified diff (returned by GitHub's diff media-type endpoint)
+ * into a map of filename → hunk content.
+ *
+ * The unified diff looks like:
+ *   diff --git a/path/to/file b/path/to/file
+ *   index abc..def 100644
+ *   --- a/path/to/file
+ *   +++ b/path/to/file
+ *   @@ -1,5 +1,6 @@
+ *    context
+ *   -removed
+ *   +added
+ *
+ * This function extracts the content from the first `@@` hunk header
+ * onwards for each file, keyed by the "b/" (new) filename.
+ */
+function parseUnifiedDiff(rawDiff: string): Map<string, string> {
+  const patches = new Map<string, string>();
+  // Split on the `diff --git ` boundary (keeping the delimiter out)
+  const sections = rawDiff.split(/^diff --git /m);
+
+  for (const section of sections) {
+    if (!section.trim()) continue;
+
+    // Extract the new filename from the "+++ b/path" line.
+    // This is more reliable than the header line for filenames with spaces.
+    const nameMatch = section.match(/^\+\+\+ b\/(.+)$/m);
+    if (!nameMatch) continue;
+
+    const filename = nameMatch[1];
+
+    // Hunk content starts at the first @@ marker
+    const hunkStart = section.indexOf('@@');
+    if (hunkStart === -1) continue;
+
+    patches.set(filename, section.substring(hunkStart));
+  }
+
+  return patches;
 }
 
 // ─── Comment posting ──────────────────────────────────────────────────────────

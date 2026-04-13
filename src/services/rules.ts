@@ -68,6 +68,9 @@ export function getBuiltInRulesPath(): string {
 /**
  * Parse a comma-separated rules string into individual RuleSources.
  *
+ * Spaces around commas are trimmed, so both `"path1,path2"` and
+ * `"path1, path2, http://..."` produce the same result.
+ *
  * Each token is classified as:
  *   - url   → starts with http:// or https://
  *   - directory → resolved path is an existing directory
