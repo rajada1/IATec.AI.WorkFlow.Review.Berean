@@ -430,11 +430,12 @@ function parseUnifiedDiff(rawDiff: string): Map<string, string> {
   for (const section of sections) {
     if (!section.trim()) continue;
 
-    // Header line: "a/path b/path"
-    const headerMatch = section.match(/^a\/(.+?) b\/(.+?)[\r\n]/);
-    if (!headerMatch) continue;
+    // Extract the new filename from the "+++ b/path" line.
+    // This is more reliable than the header line for filenames with spaces.
+    const nameMatch = section.match(/^\+\+\+ b\/(.+)$/m);
+    if (!nameMatch) continue;
 
-    const filename = headerMatch[2];
+    const filename = nameMatch[1];
 
     // Hunk content starts at the first @@ marker
     const hunkStart = section.indexOf('@@');

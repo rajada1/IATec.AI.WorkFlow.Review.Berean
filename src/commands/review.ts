@@ -268,6 +268,8 @@ export const reviewCommand = new Command('review')
       // ── 6. Post comments ──────────────────────────────────────────────────────
       // Inline comments are posted FIRST so that improvement suggestions appear
       // on the PR before the summary comment (which is always posted last).
+      // Both types are posted independently so a failure in one does not block
+      // the other.
       let postFailed = false;
 
       if (options.inline) {
@@ -277,7 +279,7 @@ export const reviewCommand = new Command('review')
         }
       }
 
-      if (options.postComment && !postFailed) {
+      if (options.postComment) {
         const success = await postGeneralComment(
           provider,
           reviewResult,
