@@ -23,25 +23,53 @@ interface CopilotToken {
 let cachedToken: CopilotToken | null = null;
 
 /**
- * Exchange GitHub PAT for a Copilot API token (cached with 60s expiry buffer)
+ * Exchange GitHub PAT for a Copilot API token (cached with 60s expiry buffer).
+ *
+ * Includes retry logic with exponential backoff for transient failures
+ * (e.g. intermittent 403 responses from the GitHub API).
  */
 async function getCopilotToken(githubToken: string): Promise<string> {
   if (cachedToken && cachedToken.expires_at > Date.now() / 1000 + 60) {
     return cachedToken.token;
   }
 
-  log(`[berean-http] Exchanging GitHub token for Copilot token...`);
+  const MAX_RETRIES = 3;
+  const BASE_DELAY_MS = 1_000;
 
-  const response = await fetch('https://api.github.com/copilot_internal/v2/token', {
-    headers: {
-      Authorization: `token ${githubToken}`,
-      Accept: 'application/json',
-      'User-Agent': 'berean-cli/0.2.0',
-    },
-  });
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    log(`[berean-http] Exchanging GitHub token for Copilot token (attempt ${attempt}/${MAX_RETRIES})...`);
+
+    const response = await fetch('https://api.github.com/copilot_internal/v2/token', {
+      headers: {
+        Authorization: `token ${githubToken}`,
+        Accept: 'application/json',
+        'User-Agent': 'berean-cli/0.2.0',
+      },
+    });
+
+    if (response.ok) {
+      const data = await response.json() as CopilotToken;
+      cachedToken = data;
+      log(`[berean-http] Copilot token obtained (expires: ${new Date(data.expires_at * 1000).toISOString()})`);
+      return data.token;
+    }
+
     const body = await response.text();
+
+    // Transient 403 or 5xx — retry after a delay
+    if ((response.status === 403 || response.status >= 500) && attempt < MAX_RETRIES) {
+      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      log(`[berean-http] Token exchange returned ${response.status}, retrying in ${delay}ms...`);
+      // Clear cached token so it won't be reused on next attempt
+      cachedToken = null;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      lastError = new Error(`Token exchange failed (${response.status}): ${body}`);
+      continue;
+    }
+
+    // Final attempt or non-retryable status — throw
     if (response.status === 403 && body.includes('Resource not accessible by personal access token')) {
       throw new Error(
         'Token exchange failed (403): the configured GitHub token is a personal access token, and this Copilot endpoint does not accept PATs. Remove GITHUB_TOKEN/GH_TOKEN/COPILOT_GITHUB_TOKEN and authenticate with `berean auth login`, or provide a GitHub token type that is allowed to exchange for a Copilot token.',
@@ -50,10 +78,7 @@ async function getCopilotToken(githubToken: string): Promise<string> {
     throw new Error(`Token exchange failed (${response.status}): ${body}`);
   }
 
-  const data = await response.json() as CopilotToken;
-  cachedToken = data;
-  log(`[berean-http] Copilot token obtained (expires: ${new Date(data.expires_at * 1000).toISOString()})`);
-  return data.token;
+  throw lastError ?? new Error('Token exchange failed after retries');
 }
 
 // ─── Chat completions ─────────────────────────────────────────────────────────
