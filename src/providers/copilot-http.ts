@@ -84,27 +84,57 @@ async function getCopilotToken(githubToken: string): Promise<string> {
 // ─── Chat completions ─────────────────────────────────────────────────────────
 
 /**
- * Call Copilot Chat Completions API directly via HTTP
+ * Call Copilot Chat Completions API via HTTP with SSE streaming.
+ *
+ * Uses an inactivity-based timeout: the timer resets on every received chunk,
+ * so a slow but active model response will never be aborted prematurely.
+ * A hard overall cap (maxTotalMs) ensures the request eventually terminates.
  *
  * @param githubToken GitHub PAT used to exchange for a Copilot token.
  * @param model Copilot model identifier.
  * @param systemPrompt System prompt content.
  * @param userPrompt User prompt content.
- * @param timeoutMs Timeout in milliseconds.
+ * @param maxTotalMs Hard overall timeout in milliseconds (default 600 s).
+ * @param inactivityMs Inactivity timeout — abort if no chunk arrives within
+ *   this window (default 60 s).
  */
 export async function chatCompletion(
   githubToken: string,
   model: string,
   systemPrompt: string,
   userPrompt: string,
-  timeoutMs: number = 300_000,
+  maxTotalMs: number = 600_000,
+  inactivityMs: number = 60_000,
 ): Promise<string> {
   const copilotToken = await getCopilotToken(githubToken);
 
-  log(`[berean-http] Sending chat completion request (model: ${model}, system: ${systemPrompt.length} chars, user: ${userPrompt.length} chars)...`);
+  log(`[berean-http] Sending streaming chat completion request (model: ${model}, system: ${systemPrompt.length} chars, user: ${userPrompt.length} chars)...`);
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let abortReason = 'overall timeout';
+
+  // Hard overall timeout
+  const overallTimer = setTimeout(() => {
+    abortReason = 'overall timeout';
+    log(`[berean-http] Hard overall timeout (${maxTotalMs / 1000}s) reached, aborting`);
+    controller.abort();
+  }, maxTotalMs);
+
+  // Inactivity timer — reset on each received chunk
+  let inactivityTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetInactivityTimer = (): void => {
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      abortReason = 'inactivity timeout';
+      log(`[berean-http] Inactivity timeout (${inactivityMs / 1000}s) reached, aborting`);
+      controller.abort();
+    }, inactivityMs);
+  };
+
+  const clearTimers = (): void => {
+    clearTimeout(overallTimer);
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+  };
 
   try {
     const response = await fetch('https://api.individual.githubcopilot.com/chat/completions', {
@@ -112,7 +142,7 @@ export async function chatCompletion(
       headers: {
         Authorization: `Bearer ${copilotToken}`,
         'Content-Type': 'application/json',
-        Accept: 'application/json',
+        Accept: 'text/event-stream',
         'User-Agent': 'berean-cli/1.7.0',
         'Editor-Version': 'berean/1.7.0',
         'Copilot-Integration-Id': 'vscode-chat',
@@ -123,29 +153,85 @@ export async function chatCompletion(
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        stream: false,
+        stream: true,
       }),
       signal: controller.signal,
     });
 
-    clearTimeout(timeoutId);
-
     if (!response.ok) {
+      clearTimers();
       const body = await response.text();
       throw new Error(`Copilot API error (${response.status}): ${body}`);
     }
 
-    const data = await response.json() as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
+    if (!response.body) {
+      clearTimers();
+      throw new Error('Copilot API returned no response body');
+    }
 
-    const content = data?.choices?.[0]?.message?.content ?? '';
-    log(`[berean-http] Response received (${content.length} chars)`);
-    return content;
+    // Start the inactivity timer once we have the response headers
+    resetInactivityTimer();
+
+    // Parse the SSE stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let contentBuffer = '';
+    let sseBuffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Reset inactivity timer on every received chunk
+        resetInactivityTimer();
+
+        sseBuffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE lines
+        const lines = sseBuffer.split('\n');
+        // Keep the last (potentially incomplete) line in the buffer
+        sseBuffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') {
+            log(`[berean-http] Stream complete (${contentBuffer.length} chars)`);
+            clearTimers();
+            return contentBuffer;
+          }
+
+          try {
+            const parsed = JSON.parse(data) as {
+              choices?: Array<{ delta?: { content?: string } }>;
+            };
+            const chunk = parsed?.choices?.[0]?.delta?.content ?? '';
+            if (chunk) {
+              contentBuffer += chunk;
+            }
+          } catch {
+            // Log malformed SSE lines at verbose level to aid troubleshooting
+            log(`[berean-http] Failed to parse SSE data: ${data.substring(0, 100)}`);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    clearTimers();
+    log(`[berean-http] Stream ended (${contentBuffer.length} chars)`);
+    return contentBuffer;
   } catch (error) {
-    clearTimeout(timeoutId);
+    clearTimers();
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`Copilot API timeout after ${timeoutMs / 1000}s`);
+      if (abortReason === 'inactivity timeout') {
+        throw new Error(`Copilot API aborted: no data received for ${inactivityMs / 1000}s (inactivity timeout)`);
+      }
+      throw new Error(`Copilot API aborted: hard overall timeout of ${maxTotalMs / 1000}s exceeded`);
     }
     throw error;
   }

@@ -104,7 +104,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
     }
 
     let content = '';
-    const TIMEOUT_MS = 300_000; // 5 min
+    const TIMEOUT_MS = 600_000; // 10 min
 
     if (sdkWorks) {
       log(`[berean] Using SDK for review...`);
@@ -208,7 +208,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
         return { success: false, error: 'No GitHub token available for HTTP fallback', model };
       }
       log(`[berean] Using direct HTTP API for review...`);
-      content = await chatCompletion(token, model, system, user, TIMEOUT_MS);
+      content = await chatCompletion(token, model, system, user);
     }
 
     if (!content || !looksLikeReviewJson(content)) {
@@ -217,7 +217,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
       if (token) {
         const reason = !content ? 'empty' : 'non-JSON (possible model thinking text)';
         log(`[berean] SDK returned ${reason}, trying direct HTTP API...`);
-        const httpContent = await chatCompletion(token, model, system, user, TIMEOUT_MS);
+        const httpContent = await chatCompletion(token, model, system, user);
         if (httpContent) content = httpContent;
       }
     }
@@ -248,7 +248,7 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
           diff,
           options.rules,
         );
-        const content = await chatCompletion(token, model, systemFallback, userFallback, 300_000);
+        const content = await chatCompletion(token, model, systemFallback, userFallback);
         if (content) {
           const result = parseReviewResponse(content, model, reviewScope);
           if (result.issues && confidenceThreshold) {
@@ -257,7 +257,9 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
           return result;
         }
       } catch (httpError) {
-        log(`[berean] HTTP fallback also failed: ${httpError instanceof Error ? httpError.message : httpError}`);
+        const httpErrMsg = httpError instanceof Error ? httpError.message : String(httpError);
+        log(`[berean] HTTP fallback also failed: ${httpErrMsg}`);
+        return { success: false, error: `SDK: ${errMsg}; HTTP fallback: ${httpErrMsg}`, model };
       }
     }
 
