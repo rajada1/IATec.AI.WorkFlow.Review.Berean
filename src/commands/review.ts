@@ -228,11 +228,15 @@ export const reviewCommand = new Command('review')
 
             const okCount = result.sources.filter(s => s.status === 'ok').length;
             const warnSources = result.sources.filter(s => s.status === 'warn');
+            const skipSources = result.sources.filter(s => s.status === 'skip');
 
-            if (warnSources.length > 0) {
-              rulesSpinner.warn(`Rules loaded from ${okCount} source(s), ${warnSources.length} warning(s)`);
+            if (warnSources.length > 0 || skipSources.length > 0) {
+              rulesSpinner.warn(`Rules loaded from ${okCount} source(s), ${warnSources.length + skipSources.length} skipped/warning(s)`);
               for (const w of warnSources) {
                 if (w.message) console.log(chalk.gray(`    ⚠  ${w.label}: ${w.message}`));
+              }
+              for (const s of skipSources) {
+                if (s.message) console.log(chalk.gray(`    ⏭  ${s.label}: ${s.message}`));
               }
             } else {
               rulesSpinner.succeed(`Rules loaded from ${okCount} source(s)`);
