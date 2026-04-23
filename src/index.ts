@@ -18,7 +18,7 @@ const program = new Command();
 program
   .name('berean')
   .description('🔍 AI-powered code review for GitHub and Azure DevOps PRs using GitHub Copilot')
-  .version('1.7.0', '-v, --version', 'Show current version');
+  .version('1.8.0', '-v, --version', 'Show current version');
 
 program.addCommand(authCommand);
 program.addCommand(reviewCommand);

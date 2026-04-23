@@ -45,7 +45,7 @@ async function getCopilotToken(githubToken: string): Promise<string> {
       headers: {
         Authorization: `token ${githubToken}`,
         Accept: 'application/json',
-        'User-Agent': 'berean-cli/1.7.0',
+        'User-Agent': 'berean-cli/1.8.0',
       },
     });
 
@@ -113,8 +113,8 @@ export async function chatCompletion(
         Authorization: `Bearer ${copilotToken}`,
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        'User-Agent': 'berean-cli/1.7.0',
-        'Editor-Version': 'berean/1.7.0',
+        'User-Agent': 'berean-cli/1.8.0',
+        'Editor-Version': 'berean/1.8.0',
         'Copilot-Integration-Id': 'vscode-chat',
       },
       body: JSON.stringify({
