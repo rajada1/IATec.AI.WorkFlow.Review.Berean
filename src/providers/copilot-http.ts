@@ -58,6 +58,28 @@ async function getCopilotToken(githubToken: string): Promise<string> {
 
     const body = await response.text();
 
+    // Permanent 403 — personal access token cannot access this endpoint
+    if (response.status === 403 && body.includes('Resource not accessible by personal access token')) {
+      throw new Error(
+        'Token exchange failed (403): the configured GitHub token is a personal access token (PAT), '
+        + 'and the Copilot token-exchange endpoint does not accept PATs.\n'
+        + '  → Remove GITHUB_TOKEN / GH_TOKEN / COPILOT_GITHUB_TOKEN from your environment\n'
+        + '  → Authenticate interactively with:  berean auth login\n'
+        + '  → Or provide a GitHub App / OAuth token that is allowed to exchange for a Copilot token.',
+      );
+    }
+
+    // Permanent 404 — token owner has no active Copilot seat / license
+    if (response.status === 404) {
+      throw new Error(
+        'Token exchange failed (404): GitHub returned "Not Found" for the Copilot token endpoint. '
+        + 'This usually means the GitHub account behind the token does not have an active Copilot seat.\n'
+        + '  → Verify that the token owner has a GitHub Copilot license (individual or organization seat)\n'
+        + '  → If using a CI token (e.g. Actions GITHUB_TOKEN), it cannot access Copilot — use a user token instead\n'
+        + '  → Check which token is active:  env | grep -E "GITHUB_TOKEN|GH_TOKEN|COPILOT_GITHUB_TOKEN"',
+      );
+    }
+
     // Transient 403 or 5xx — retry after a delay
     if ((response.status === 403 || response.status >= 500) && attempt < MAX_RETRIES) {
       const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
@@ -69,12 +91,6 @@ async function getCopilotToken(githubToken: string): Promise<string> {
       continue;
     }
 
-    // Final attempt or non-retryable status — throw
-    if (response.status === 403 && body.includes('Resource not accessible by personal access token')) {
-      throw new Error(
-        'Token exchange failed (403): the configured GitHub token is a personal access token, and this Copilot endpoint does not accept PATs. Remove GITHUB_TOKEN/GH_TOKEN/COPILOT_GITHUB_TOKEN and authenticate with `berean auth login`, or provide a GitHub token type that is allowed to exchange for a Copilot token.',
-      );
-    }
     throw new Error(`Token exchange failed (${response.status}): ${body}`);
   }
 
