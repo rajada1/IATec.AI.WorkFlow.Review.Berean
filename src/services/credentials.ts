@@ -1,9 +1,56 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { fileURLToPath } from 'url';
 
 const CONFIG_DIR = path.join(os.homedir(), '.berean');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+
+/**
+ * Read the package version from `package.json` at startup.
+ *
+ * The file lives outside `rootDir` (one level above `src/`), so we resolve
+ * it relative to this compiled module rather than importing the JSON
+ * (which would require widening the TS rootDir). Fails soft to `'0.0.0'`
+ * to keep the User-Agent string well-formed even if the file is missing
+ * (e.g. in unusual install layouts).
+ */
+function readPackageVersion(): string {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    // dist/services/credentials.js → ../../package.json
+    const candidates = [
+      path.resolve(here, '..', '..', 'package.json'),
+      path.resolve(here, '..', 'package.json'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        const pkg = JSON.parse(fs.readFileSync(candidate, 'utf-8')) as { version?: string };
+        if (pkg.version) return pkg.version;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return '0.0.0';
+}
+
+const BEREAN_VERSION = readPackageVersion();
+
+/**
+ * Canonical User-Agent string used for every outbound HTTP call to GitHub
+ * and the Copilot gateway.
+ *
+ * Mirrors the format produced by the official `@github/copilot` CLI's
+ * `ene()` function (`node_modules/@github/copilot/app.js:5611`):
+ *
+ *   `${name}/${version} (${platform} node-${nodeVersion}) term/${TERM}`
+ *
+ * Keeping the format identical to the upstream CLI minimizes the chance
+ * the Copilot gateway's UA-based heuristics treat berean as a foreign
+ * client.
+ */
+export const BEREAN_USER_AGENT = `berean/${BEREAN_VERSION} (${process.platform} node-${process.versions.node}) term/${process.env.TERM ?? 'unknown'}`;
 
 export interface Config {
   default_model?: string;
@@ -19,6 +66,14 @@ function ensureConfigDir(): void {
   }
 }
 
+function normalizeTokenValue(token: string): string {
+  return token.trim().replace(/^(token|bearer)\s+/i, '');
+}
+
+export function normalizeGitHubToken(token: string): string {
+  return normalizeTokenValue(token);
+}
+
 /**
  * Get GitHub token for GitHub REST API usage.
  *
@@ -26,11 +81,13 @@ function ensureConfigDir(): void {
  * then fall back to the other compatible variable names.
  */
 export function getGitHubToken(): string | null {
-  return process.env.GITHUB_TOKEN
+  const token = process.env.GITHUB_TOKEN
     || process.env.GH_TOKEN
     || process.env.COPILOT_GITHUB_TOKEN
     || process.env.GITHUBTOKEN
     || null;
+
+  return token ? normalizeTokenValue(token) : null;
 }
 
 /**
@@ -153,11 +210,25 @@ export function getMaxRulesChars(defaultMax?: number): number {
  * Keeps the existing priority used by the Copilot integration.
  */
 export function getGitHubTokenFromAzure(): string | null {
-  return process.env.COPILOT_GITHUB_TOKEN
+  const token = process.env.COPILOT_GITHUB_TOKEN
     || process.env.GH_TOKEN
     || process.env.GITHUB_TOKEN
     || process.env.GITHUBTOKEN
     || null;
+
+  return token ? normalizeTokenValue(token) : null;
+}
+
+export function getGitHubTokenFromAzureSource(): string | null {
+  if (process.env.COPILOT_GITHUB_TOKEN) return 'COPILOT_GITHUB_TOKEN';
+  if (process.env.GH_TOKEN) return 'GH_TOKEN';
+  if (process.env.GITHUB_TOKEN) return 'GITHUB_TOKEN';
+  if (process.env.GITHUBTOKEN) return 'GITHUBTOKEN';
+  return null;
+}
+
+export function tokenLooksPrefixed(token: string): boolean {
+  return /^(token|bearer)\s+/i.test(token.trim());
 }
 
 /**

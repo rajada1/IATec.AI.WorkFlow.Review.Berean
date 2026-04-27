@@ -1,6 +1,15 @@
-import { CopilotClient, approveAll } from '@github/copilot-sdk';
+import { CopilotClient, type PermissionHandler } from '@github/copilot-sdk';
 import { getGitHubTokenFromAzure } from '../services/credentials.js';
+import { isNonInteractiveEnvironment } from '../services/copilot-auth.js';
 import { chatCompletion } from './copilot-http.js';
+
+// `approveAll` era exportado por versões anteriores do @github/copilot-sdk
+// (<= 0.1.x antigo) como um PermissionHandler pronto que aprovava todas as
+// solicitações de permissão vindas do agente. A versão atualmente instalada
+// (0.1.25) não exporta mais esse helper, mas mantém o contrato de
+// PermissionHandler retornando { kind: "approved" }. Reimplementamos aqui
+// localmente para preservar o comportamento original (auto-aprovar tool calls).
+const approveAll: PermissionHandler = () => ({ kind: 'approved' });
 
 export interface ReviewIssue {
   severity: 'critical' | 'warning' | 'suggestion';
@@ -76,39 +85,49 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
   const reviewScope = extractReviewScope(diff);
 
   try {
-    const client = await getClient();
-
+    const token = getGitHubTokenFromAzure();
     const { system, user } = buildReviewPrompt(language, diff, rules);
     const promptSize = system.length + user.length;
 
-    log(`[berean] Token source: ${getGitHubTokenFromAzure() ? 'env var' : 'SDK default'}`);
+    log(`[berean] Token source: ${token ? 'env var' : 'SDK default'}`);
     log(`[berean] Node version: ${process.version}`);
     log(`[berean] Prompt size: ${promptSize} chars (~${Math.round(promptSize / 4)} tokens)`);
 
-    // Quick connectivity test via SDK (30s) — if it fails, go straight to HTTP
-    log(`[berean] Starting client...`);
-    await client.start();
-    log(`[berean] Client started, testing SDK connectivity...`);
-
-    let sdkWorks = false;
-    const testSession = await client.createSession({ model, streaming: false, onPermissionRequest: approveAll });
-    try {
-      const testResponse = await testSession.sendAndWait({ prompt: 'Reply with just: OK' }, 30_000);
-      const testContent = testResponse?.data?.content ?? '';
-      if (testContent) {
-        sdkWorks = true;
-        log(`[berean] ✓ SDK works (test response: ${testContent.substring(0, 20)})`);
-      }
-    } catch (testErr) {
-      log(`[berean] ✗ SDK failed: ${testErr instanceof Error ? testErr.message : testErr}`);
-    }
-
     let content = '';
     const TIMEOUT_MS = 300_000; // 5 min
+    let sdkWorks = false;
+    let client: CopilotClient | null = null;
+
+    // SDK is the primary path in all environments (including CI), as long as a token
+    // or valid session is available. The SDK natively accepts `githubToken` for CI use
+    // (see @github/copilot-sdk typings: CopilotClientOptions.githubToken).
+    // HTTP is kept only as a last-resort fallback if the SDK throws/times out.
+    try {
+      client = await getClient();
+
+      // Quick connectivity test via SDK (30s) — if it fails, fall through to HTTP
+      log(`[berean] Starting client...`);
+      await client.start();
+      log(`[berean] Client started, testing SDK connectivity...`);
+
+      const testSession = await client.createSession({ model, streaming: false, onPermissionRequest: approveAll });
+      try {
+        const testResponse = await testSession.sendAndWait({ prompt: 'Reply with just: OK' }, 30_000);
+        const testContent = testResponse?.data?.content ?? '';
+        if (testContent) {
+          sdkWorks = true;
+          log(`[berean] ✓ SDK works (test response: ${testContent.substring(0, 20)})`);
+        }
+      } catch (testErr) {
+        log(`[berean] ✗ SDK connectivity test failed: ${testErr instanceof Error ? testErr.message : testErr}`);
+      }
+    } catch (startErr) {
+      log(`[berean] ✗ SDK initialization failed: ${startErr instanceof Error ? startErr.message : startErr}`);
+    }
 
     if (sdkWorks) {
       log(`[berean] Using SDK for review...`);
-      const session = await client.createSession({
+      const session = await client!.createSession({
         model,
         streaming: false,
         systemMessage: { content: system },
@@ -203,7 +222,6 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
       });
     } else {
       // SDK doesn't work — use direct HTTP API
-      const token = getGitHubTokenFromAzure();
       if (!token) {
         return { success: false, error: 'No GitHub token available for HTTP fallback', model };
       }
@@ -213,7 +231,6 @@ export async function reviewCode(diff: string, options: ReviewOptions = {}): Pro
 
     if (!content || !looksLikeReviewJson(content)) {
       // SDK returned empty or non-JSON (e.g. model "thinking" text) — try direct HTTP as fallback
-      const token = getGitHubTokenFromAzure();
       if (token) {
         const reason = !content ? 'empty' : 'non-JSON (possible model thinking text)';
         log(`[berean] SDK returned ${reason}, trying direct HTTP API...`);
@@ -631,7 +648,7 @@ ${diff.substring(0, 2_000)}`;
   }
 
   // SDK fallback
-  if (!content) {
+  if (!content && !isNonInteractiveEnvironment()) {
     try {
       const client = await getClient();
       await client.start();
