@@ -1,6 +1,6 @@
 {
   "name": "berean",
-  "version": "1.8.3",
+  "version": "1.9.0",
   "description": "AI-powered code review CLI for GitHub and Azure DevOps PRs using GitHub Copilot",
   "main": "dist/index.js",
   "bin": {
